@@ -141,3 +141,48 @@ def test_strptime_is_known_broken_and_the_prompt_says_so(sb):
                 '    return {"v": datetime.date.fromisoformat(params["s"]).year}\n',
                 "solve", [{"s": "2024-01-05"}])
     assert ok.results[0].value == {"v": 2024}
+
+
+# --- the credential gate: match the secret, not the word ---------------------------------
+def test_static_check_accepts_ordinary_identifiers_named_after_credentials():
+    """`token` and `password` are ordinary field names, not secrets. The gate used to fire
+    on the *word*, so a function that counts tokens — or just reads `params["password"]`
+    to measure its length — was rejected before it ever reached the sandbox. That is the
+    expensive direction: a gate that fires on correct code costs more than one that
+    misses a bug (README, "The one time the repair loop fired")."""
+    for src in (
+        'def solve(params, ctx):\n'
+        '    token = params["s"]\n'
+        '    return {"n": len(token)}\n',
+        'def solve(params, ctx):\n'
+        '    return {"token": params["token"], "ok": True}\n',
+        'def solve(params, ctx):\n'
+        '    password = params.get("password", "")\n'
+        '    return {"length": len(password)}\n',
+        'def solve(params, ctx):\n'
+        '    tokens = params["text"].split()\n'
+        '    return {"tokens": len(tokens)}\n',
+    ):
+        assert check(src) == [], (src, check(src))
+
+
+def test_static_check_still_rejects_a_hard_coded_secret():
+    """The other direction was just as wrong: the old rule matched the name `API_KEY`
+    and never looked at the value, so `key = "sk-..."` sailed through."""
+    for src in (
+        # a recognisable key shape, whatever it is assigned to
+        'def solve(params, ctx):\n'
+        '    k = "sk-abcdefghijklmnop"\n'
+        '    return {"k": k}\n',
+        # a credential-named binding holding a literal is still a hard-coded credential
+        'def solve(params, ctx):\n'
+        '    token = "abc12345"\n'
+        '    return {"t": token}\n',
+        'def solve(params, ctx):\n'
+        '    return {"password": "letmein-please"}\n',
+        # the existing case has to keep working, and now for the right reason
+        'def solve(params, ctx):\n'
+        '    return {}\n'
+        'API_KEY = "sk-abcdefghijklmnop"\n',
+    ):
+        assert any("credential" in v for v in check(src)), (src, check(src))
