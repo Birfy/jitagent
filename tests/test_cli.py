@@ -78,6 +78,35 @@ def test_call_with_a_bad_argument_is_a_guard_failure_not_a_crash(home, capsys):
     assert "guard_failed" in capsys.readouterr().out
 
 
+def test_call_with_inline_json_longer_than_name_max(home, capsys):
+    """The whole point is calling one function on many records, so the payload is
+    routinely longer than the 255-byte filename limit. `Path(...).exists()` was asked
+    first, so a perfectly ordinary batch call raised `OSError: File name too long`
+    before `json.loads` ever ran."""
+    payload = json.dumps({"records": [{"name": f"n{i}", "score": i}
+                                      for i in range(200)]})
+    assert len(payload) > 255
+
+    assert run(home, "call", "rank", payload) == 0, capsys.readouterr().err
+    assert '"rank": 1' in capsys.readouterr().out
+
+
+def test_call_with_a_file_path_still_works(home, tmp_path, capsys):
+    payload = json.dumps({"records": [{"name": "z", "score": 1},
+                                      {"name": "y", "score": 9}]})
+    path = tmp_path / "args.json"
+    path.write_text(payload)
+
+    assert run(home, "call", "rank", str(path)) == 0
+    assert '"rank": 1' in capsys.readouterr().out
+
+
+def test_call_with_neither_json_nor_file_is_a_clear_error(home, capsys):
+    assert run(home, "call", "rank", "this is neither json nor a file") == 1
+    err = capsys.readouterr().err
+    assert "neither" in err and "Traceback" not in err
+
+
 def test_list_and_inspect_show_the_name(home, capsys):
     assert run(home, "list") == 0
     assert "rank" in capsys.readouterr().out
