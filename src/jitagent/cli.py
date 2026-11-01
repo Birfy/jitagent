@@ -192,10 +192,14 @@ def cmd_list(args) -> int:
 
 
 def cmd_inspect(args) -> int:
+    from .jit import NoSuchVersion, resolve_version
     from .registry import Registry
 
-    reg = Registry(args.home)
-    fn = reg.get(args.handle)
+    try:
+        fn, shown = resolve_version(args.handle, registry=Registry(args.home))
+    except NoSuchVersion as e:
+        print(e, file=sys.stderr)
+        return 1
     if fn is None:
         print(f"no such function: {args.handle}", file=sys.stderr)
         return 1
@@ -213,28 +217,35 @@ def cmd_inspect(args) -> int:
             print(f"      ! rests on something the requirement did not say: {e.assumes}")
 
     print("\n-- versions --")
-    best = fn.best()
     for v in fn.versions:
-        mark = "*" if best and v.name == best.name else " "
+        mark = "*" if shown and v.name == shown.name else " "
         print(f" {mark}{v.name}  {v.level.value:<10}{v.created_at}  {v.model or '-'}"
               f"  {v.attempts} attempt(s)  {v.input_tokens}in/{v.output_tokens}out")
 
-    if args.code and best:
-        print(f"\n-- {best.name} source --")
-        print(best.code)
+    if args.code and shown:
+        print(f"\n-- {shown.name} source --")
+        print(shown.code)
     return 0
 
 
 def cmd_get(args) -> int:
-    """Print the source for a name. This is "look up the code by its name"."""
-    from .jit import get_code
+    """Print the source for a name. This is "look up the code by its name" — and by
+    `@version` too, so what you read is what `call` would run."""
+    from .jit import NoSuchVersion, resolve_version
     from .registry import Registry
 
-    code = get_code(args.name, registry=Registry(args.home))
-    if not code:
+    try:
+        fn, v = resolve_version(args.name, registry=Registry(args.home))
+    except NoSuchVersion as e:
+        print(e, file=sys.stderr)
+        return 1
+    if fn is None:
         print(f"no function named {args.name!r} (try: jitagent list)", file=sys.stderr)
         return 1
-    print(code, end="" if code.endswith("\n") else "\n")
+    if v is None:
+        print(f"{fn.ref} has no versions", file=sys.stderr)
+        return 1
+    print(v.code, end="" if v.code.endswith("\n") else "\n")
     return 0
 
 
