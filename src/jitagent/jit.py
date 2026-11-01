@@ -33,7 +33,7 @@ from typing import Any
 from .llm import LLMClient
 from .lookup import Candidate, Lookup, find, search
 from .propose import Proposal, propose_tests
-from .registry import Function, NotCacheable, Registry, split_ref
+from .registry import Function, NotCacheable, Registry, Version, split_ref
 from .runtime import CallOutcome, Runtime, call_function  # noqa: F401  part of the API
 from .sandbox import Sandbox
 from .synth import SynthResult, compile_function as synthesize, spec_for
@@ -265,7 +265,7 @@ class NoSuchVersion(KeyError):
 
 
 def resolve_version(name: str, *, registry: Registry | None = None,
-                    ) -> tuple[Function | None, Any]:
+                    ) -> tuple[Function | None, Version | None]:
     """`(function, version)` for `<name-or-handle>[@version]`.
 
     `call rank@v1` has always run v1, so a reader asking for `rank@v1` has to get v1's

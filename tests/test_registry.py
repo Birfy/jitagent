@@ -160,9 +160,6 @@ def test_a_function_without_a_name_falls_back_to_its_handle(reg):
     assert fn.ref == fn.handle
 
 
-
-
-
 def test_get_code_honours_the_version_pin(reg):
     """`get_code` is the read half of "text in, code out"; a ref that names a version
     must fetch that version, the same way `call` runs that version."""
