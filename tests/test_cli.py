@@ -95,3 +95,46 @@ def test_search_ranks_by_similarity(home, capsys):
 def test_selftest_runs_the_corpus(capsys):
     assert main(["selftest"]) == 0
     assert "behaved as expected" in capsys.readouterr().out
+
+
+# --- the @version pin ------------------------------------------------------------
+# `call rank@v1` has always honoured the pin; `get` and `inspect` ignored it and
+# printed the newest version instead. That is the one thing this project must never
+# do: hand back something that looks like what you asked for and is not.
+
+CODE_V2 = CODE.replace(
+    "def solve(params, ctx):\n",
+    "def solve(params, ctx):\n    # impl_two\n", 1)
+
+
+@pytest.fixture
+def home_two_versions(home):
+    """The same function stored twice, so "newest" and "pinned" differ."""
+    reg = Registry(home)
+    r = compile_function(REQ, EXAMPLES, client=ScriptedClient([CODE_V2]), sandbox=Sandbox())
+    assert r.ok, r.render()
+    reg.put(REQ, r.spec, r.code, r.report, EXAMPLES, name="rank")
+    assert [v.name for v in reg.get("rank").versions] == ["v1", "v2"]
+    return home
+
+
+def test_get_returns_the_version_you_pinned(home_two_versions, capsys):
+    assert run(home_two_versions, "get", "rank@v1") == 0
+    assert "impl_two" not in capsys.readouterr().out
+
+    assert run(home_two_versions, "get", "rank@v2") == 0
+    assert "impl_two" in capsys.readouterr().out
+
+
+def test_get_with_a_version_that_does_not_exist_fails_loudly(home_two_versions, capsys):
+    assert run(home_two_versions, "get", "rank@v9") == 1
+    cap = capsys.readouterr()
+    assert cap.out == ""            # not some other version's source
+    assert "no version v9" in cap.err
+
+
+def test_inspect_code_shows_the_version_you_pinned(home_two_versions, capsys):
+    assert run(home_two_versions, "inspect", "rank@v1", "--code") == 0
+    out = capsys.readouterr().out
+    assert "v1 source --" in out
+    assert "impl_two" not in out.split("v1 source --")[1]

@@ -161,3 +161,15 @@ def test_a_function_without_a_name_falls_back_to_its_handle(reg):
 
 
 
+
+
+def test_get_code_honours_the_version_pin(reg):
+    """`get_code` is the read half of "text in, code out"; a ref that names a version
+    must fetch that version, the same way `call` runs that version."""
+    from jitagent.jit import get_code
+
+    second = "def solve(params, ctx):\n    return {'n': 2}\n"
+    reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name="group_sum")
+    reg.put(REQ, SPEC, second, report(), EXAMPLES, name="group_sum")
+    assert get_code("group_sum@v1", registry=reg).strip() == CODE.strip()
+    assert get_code("group_sum@v2", registry=reg).strip() == second.strip()
