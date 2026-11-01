@@ -130,7 +130,18 @@ def test_get_with_a_version_that_does_not_exist_fails_loudly(home_two_versions, 
     assert run(home_two_versions, "get", "rank@v9") == 1
     cap = capsys.readouterr()
     assert cap.out == ""            # not some other version's source
-    assert "no version v9" in cap.err
+    # the exact line, not a substring: a KeyError would print '"..."' with quotes and
+    # still satisfy a substring check, which is how that stayed unnoticed the first time
+    assert cap.err.strip() == "rank has no version 'v9' (it has: v1, v2)"
+
+
+def test_get_does_not_echo_control_bytes_from_a_ref(home_two_versions, capsys):
+    """The ref goes straight to a terminal; an ESC byte in it is a log-spoofing
+    primitive, so the version is printed with repr."""
+    assert run(home_two_versions, "get", "rank@v1\x1b[31mINJECTED") == 1
+    err = capsys.readouterr().err
+    assert "\x1b" not in err          # no raw escape byte reaches the terminal
+    assert "\\x1b[31m" in err         # shown escaped, as text
 
 
 def test_inspect_code_shows_the_version_you_pinned(home_two_versions, capsys):

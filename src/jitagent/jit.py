@@ -255,12 +255,15 @@ def _bank_the_hit(reg: Registry, lk: Lookup, examples: list[Example],
         reg.save_tests(lk.fn)
 
 
-class NoSuchVersion(KeyError):
+class NoSuchVersion(ValueError):
     """The function exists, but not the version the ref pinned.
 
     Deliberately not "no such function": one of those means you misremembered the
     name, the other means you misremembered the version, and the fix is different —
     `jitagent list` versus `jitagent inspect <name>`.
+
+    Not a KeyError, which `print()` renders as a quoted repr: the CLI prints this
+    exception directly, and `'rank has no version v9'` reads like a bug in the printer.
     """
 
 
@@ -283,14 +286,18 @@ def resolve_version(name: str, *, registry: Registry | None = None,
     v = fn.version(want)
     if v is None:
         have = ", ".join(x.name for x in fn.versions) or "none"
-        raise NoSuchVersion(f"{fn.ref} has no version {want} (it has: {have})")
+        # !r on the version the caller typed: it goes straight to a terminal, and a
+        # raw ESC byte there is a log-spoofing primitive.
+        raise NoSuchVersion(f"{fn.ref} has no version {want!r} (it has: {have})")
     return fn, v
 
 
 def get_code(name: str, *, registry: Registry | None = None) -> str:
     """Fetch source by name (or handle), and by `@version` when the ref carries one.
     Returns the newest version when it does not; empty string when there is nothing
-    under that ref."""
+    under that ref — including a pin that does not exist, because this function's
+    contract is "source or empty". `resolve_version` is how a caller tells those two
+    apart."""
     try:
         _, v = resolve_version(name, registry=registry)
     except NoSuchVersion:
