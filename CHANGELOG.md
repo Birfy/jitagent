@@ -3,6 +3,17 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- `compile` explains an unusable requirement file in one line instead of dumping a
+  traceback: a missing path, invalid JSON, a non-object top level, a missing
+  `requirement` or `examples` key, and a seed without `input`/`output` all exit 2
+  naming the file and the reason, and nothing is written. `FileNotFoundError`,
+  `JSONDecodeError`, `TypeError` and `KeyError` no longer reach the user as stack
+  traces from the command they run first.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
