@@ -11,7 +11,7 @@ import pytest
 from jitagent import Example, Level, Report, Spec
 # TestSet is aliased to Suite: pytest collects any class named Test* and then
 # complains that it has an __init__
-from jitagent.registry import NotCacheable, Registry
+from jitagent.registry import BadName, NotCacheable, Registry
 from jitagent.registry import TestSet as Suite
 from jitagent.registry import spec_hash
 from jitagent.types import GateResult
@@ -161,3 +161,40 @@ def test_a_function_without_a_name_falls_back_to_its_handle(reg):
 
 
 
+
+# --- names that no command could type back ---------------------------------
+def test_a_name_with_at_is_refused(reg):
+    """A name is a *reference*, and every command parses one as `<name>[@version]`.
+
+    `a@b` was accepted and written to spec.json, after which `get a@b` split it into
+    name `a` + version `b`, found no such name, and exited 1. The name supplied by the
+    user could never be the name looked up — so the store must not accept it at all.
+    """
+    with pytest.raises(BadName, match="cannot be stored as a name"):
+        reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name="a@b")
+    assert list(reg.all()) == [], "a refused name must not leave half a function behind"
+
+
+@pytest.mark.parametrize("name", [" rank", "rank ", " rank "])
+def test_a_name_with_edge_spaces_is_refused(reg, name):
+    """`split_ref` strips the base, so " rank" is looked up as "rank": storing the
+    padded spelling makes a function whose name no command can produce."""
+    with pytest.raises(BadName, match="cannot be stored as a name"):
+        reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    assert list(reg.all()) == []
+
+
+@pytest.mark.parametrize("name", ["ra\nnk", "ra\x1bnk", "rank\x7f"])
+def test_a_name_with_control_characters_is_refused(reg, name):
+    """`jitagent list` and the error messages echo names to a terminal, so a stored
+    control byte is a log-spoofing primitive in the one place people look for names."""
+    with pytest.raises(BadName, match="control character"):
+        reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    assert list(reg.all()) == []
+
+
+def test_a_name_with_an_inner_space_still_works(reg):
+    """The guard is about references, not about being restrictive: an inner space is
+    not split, trimmed or escaped by anything on the way back in."""
+    fn = reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name="the rank function")
+    assert reg.get("the rank function").spec_hash == fn.spec_hash
