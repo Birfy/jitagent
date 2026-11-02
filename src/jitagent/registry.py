@@ -77,6 +77,40 @@ def split_ref(ref: str) -> tuple[str, str | None]:
     return base.strip(), (ver.strip() or None)
 
 
+def check_name(name: str) -> str:
+    """Refuse a name that the reference parser could not hand back.
+
+    A name is a reference: every command parses `<name-or-handle>[@version]` by
+    splitting at the first `@`, so a stored `a@b` can only ever be looked up as name
+    `a` with version `b` — a function that exists and that nothing can reach. The same
+    goes for edge whitespace, which `split_ref` trims away, and for control characters,
+    which `jitagent list` and the error messages print raw to a terminal.
+
+    It runs where a name becomes durable (`save_spec` on a new or renamed spec),
+    because that is where both naming paths meet: `put`, and the cache-hit rename in
+    `jit._bank_the_hit` that never goes through `put`.
+    """
+    if not name:
+        return name
+    base, version = split_ref(name)
+    if version is not None or base != name:
+        # Name the lookup the parser would actually perform: for `a@` that is name
+        # `a` with no version (the '@' is simply dropped), for `a@b` it is `a` + `b`,
+        # and for ` rank` it is `rank`. Saying "it was trimmed" of `a@` would be wrong.
+        looked_up = (f"{base!r} with version {version!r}" if version is not None
+                     else repr(base))
+        raise BadName(
+            f"{name!r} cannot be stored as a name: a reference is parsed as "
+            f"<name>[@version], so this one would be looked up as {looked_up}, and "
+            "nothing could ever reach it. Drop the '@' and any leading or trailing "
+            "spaces.")
+    if not name.isprintable():
+        raise BadName(
+            f"{name!r} cannot be stored as a name: it contains a control character, "
+            "and every command that echoes a name would print it raw to a terminal.")
+    return name
+
+
 @dataclass
 class TestSet:
     """The test cases. They only accumulate — deleting one throws away a piece of
@@ -188,6 +222,10 @@ class NameTaken(ValueError):
     pass
 
 
+class BadName(ValueError):
+    """A name no command could type back — so nothing could ever reach it."""
+
+
 class Registry:
     def __init__(self, root: Path | None = None):
         self.root = Path(root) if root else home() / "registry"
@@ -293,10 +331,10 @@ class Registry:
         fn = self._load(self.dir_of(h)) if (self.dir_of(h) / "spec.json").exists() else None
         if fn is None:
             fn = Function(spec_hash=h, requirement=requirement, spec=spec,
-                          tests=TestSet(), created_at=_now(), name=name)
+                          tests=TestSet(), created_at=_now(), name=check_name(name))
             self.save_spec(fn)
         elif name and fn.name != name:
-            fn.name = name                       # add a name, or rename
+            fn.name = check_name(name)           # add a name, or rename
             self.save_spec(fn)
 
         for ex in examples:
@@ -312,6 +350,10 @@ class Registry:
         return fn
 
     def save_spec(self, fn: Function) -> None:
+        # The one place a name becomes durable. `put` (create and rename) and the
+        # cache-hit rename in `jit._bank_the_hit` both land here, so a name that no
+        # command could type back is refused before it reaches the disk.
+        check_name(fn.name)
         _dump(self.dir_of(fn.spec_hash) / "spec.json", fn.spec_meta())
 
     def save_tests(self, fn: Function) -> None:

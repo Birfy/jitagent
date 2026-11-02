@@ -74,7 +74,7 @@ def cmd_selftest(args) -> int:
 def cmd_compile(args) -> int:
     """Look in the cache first; only synthesise on a miss. Only that path costs tokens."""
     from .jit import compile_function
-    from .registry import Registry
+    from .registry import BadName, Registry
 
     meta = _json.loads(Path(args.requirement).read_text())
     examples = [Example.from_dict(e) for e in meta["examples"]]
@@ -90,6 +90,11 @@ def cmd_compile(args) -> int:
                              model=args.model, name=args.name or meta.get("name", ""),
                              max_attempts=args.attempts)
     except NoCredentials as e:
+        print(e, file=sys.stderr)
+        return 2
+    except BadName as e:
+        # The name is judged while a cache hit is being labelled, before anything is
+        # written: say why, and leave the function's existing name exactly as it was.
         print(e, file=sys.stderr)
         return 2
     print(r.render())

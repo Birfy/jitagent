@@ -8,6 +8,7 @@ this gets used; it should not rest on manual testing.
 No network: seed the registry through ScriptedClient, then exercise the CLI's read path.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -95,3 +96,31 @@ def test_search_ranks_by_similarity(home, capsys):
 def test_selftest_runs_the_corpus(capsys):
     assert main(["selftest"]) == 0
     assert "behaved as expected" in capsys.readouterr().out
+
+def test_compile_refuses_a_name_that_no_command_could_reach(home, tmp_path, capsys):
+    """The end-to-end hole: `compile --name a@b` renamed the *cached* function.
+
+    The name was written by the cache-hit path, not by `put`, so the ref parser could
+    never produce it again: `get a@b` looks up name `a` with version `b`. One command
+    turned a reachable function into an unreachable one, and the working name with it.
+    """
+    req = tmp_path / "rename.json"
+    req.write_text(json.dumps({"requirement": REQ,
+                               "examples": [e.to_dict() for e in EXAMPLES]}))
+
+    assert run(home, "compile", str(req), "--name", "a@b") == 2, "refuse it, do not rename"
+    err = capsys.readouterr().err
+    # The whole line, unquoted: if BadName ever regressed to a KeyError subclass,
+    # print(e) would wrap this in quotes and a substring assertion would still pass.
+    assert err.strip() == (
+        "'a@b' cannot be stored as a name: a reference is parsed as <name>[@version], so "
+        "this one would be looked up as 'a' with version 'b', and nothing could ever reach "
+        "it. Drop the '@' and any leading or trailing spaces."
+    )
+    assert "Traceback" not in err
+
+    stored = sorted(json.loads(p.read_text()).get("name", "")
+                    for p in Path(home).glob("*/spec.json"))
+    assert stored == ["rank"], "nothing may be renamed by a command that failed"
+    assert run(home, "get", "rank") == 0
+    assert run(home, "get", "a@b") == 1
