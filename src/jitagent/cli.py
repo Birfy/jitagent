@@ -92,6 +92,10 @@ def _load_requirement(path: str):
         raw = p.read_text()
     except OSError as e:
         raise BadRequirement(f"cannot read {path!r}: {e.strerror or e}") from e
+    except UnicodeDecodeError as e:
+        # A UTF-16 save or a binary file lands here; it is not JSON either, but the
+        # decoder fails first, and that is the more useful thing to say.
+        raise BadRequirement(f"cannot read {path!r}: not UTF-8 text ({e})") from e
     try:
         meta = _json.loads(raw)
     except ValueError as e:
@@ -115,7 +119,8 @@ def _load_requirement(path: str):
                 f"(missing {e.args[0]!r})") from e
         except (TypeError, AttributeError) as e:
             raise BadRequirement(
-                f"{path!r}: example {i} is not a seed object: {e}") from e
+                f'{path!r}: example {i} needs to be an object with "input" and '
+                f'"output" ({e})') from e
     return meta, examples
 
 

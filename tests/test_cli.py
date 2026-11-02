@@ -113,6 +113,17 @@ def test_compile_with_a_non_object_top_level_says_an_object_is_required(
     assert str(bad) in err and "JSON object" in err and "array" in err
 
 
+def test_compile_with_a_file_that_is_not_utf8_says_so(home, tmp_path, capsys):
+    """A UTF-16 save is the classic Windows answer to "it is JSON, why won't it read":
+    read_text fails at the decode step, one exception before the JSON parser."""
+    bad = tmp_path / "utf16.json"
+    bad.write_text(json.dumps({"requirement": REQ, "examples": []}), encoding="utf-16")
+    assert run(home, "compile", str(bad)) == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert str(bad) in err and "not UTF-8" in err
+
+
 def test_compile_without_examples_says_what_the_file_needs(home, tmp_path, capsys):
     bad = _requirement_file(tmp_path, {"requirement": REQ})
     assert run(home, "compile", str(bad)) == 2
