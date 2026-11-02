@@ -110,7 +110,13 @@ def test_compile_refuses_a_name_that_no_command_could_reach(home, tmp_path, caps
 
     assert run(home, "compile", str(req), "--name", "a@b") == 2, "refuse it, do not rename"
     err = capsys.readouterr().err
-    assert "a@b" in err and "cannot be stored as a name" in err
+    # The whole line, unquoted: if BadName ever regressed to a KeyError subclass,
+    # print(e) would wrap this in quotes and a substring assertion would still pass.
+    assert err.strip() == (
+        "'a@b' cannot be stored as a name: a reference is parsed as <name>[@version], so "
+        "this one would be looked up as 'a' with version 'b', and nothing could ever reach "
+        "it. Drop the '@' and any leading or trailing spaces."
+    )
     assert "Traceback" not in err
 
     stored = sorted(json.loads(p.read_text()).get("name", "")

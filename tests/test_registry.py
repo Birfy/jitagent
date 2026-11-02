@@ -177,6 +177,9 @@ def test_a_name_with_at_is_refused(reg, name, looked_up):
     """
     with pytest.raises(BadName, match="cannot be stored as a name") as exc:
         reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    # startswith, not `in`: a regression to `KeyError` would make print(e) wrap the whole
+    # message in quotes, and every substring assertion would still pass. #10 taught this.
+    assert str(exc.value).startswith(f"{name!r} cannot be stored as a name:")
     assert f"would be looked up as {looked_up}" in str(exc.value)
     assert list(reg.all()) == [], "a refused name must not leave half a function behind"
 
@@ -185,8 +188,10 @@ def test_a_name_with_at_is_refused(reg, name, looked_up):
 def test_a_name_with_edge_spaces_is_refused(reg, name):
     """`split_ref` strips the base, so " rank" is looked up as "rank": storing the
     padded spelling makes a function whose name no command can produce."""
-    with pytest.raises(BadName, match="cannot be stored as a name"):
+    with pytest.raises(BadName, match="cannot be stored as a name") as exc:
         reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    assert str(exc.value).startswith(f"{name!r} cannot be stored as a name:")
+    assert "would be looked up as 'rank'" in str(exc.value)
     assert list(reg.all()) == []
 
 
@@ -194,8 +199,10 @@ def test_a_name_with_edge_spaces_is_refused(reg, name):
 def test_a_name_with_control_characters_is_refused(reg, name):
     """`jitagent list` and the error messages echo names to a terminal, so a stored
     control byte is a log-spoofing primitive in the one place people look for names."""
-    with pytest.raises(BadName, match="control character"):
+    with pytest.raises(BadName, match="control character") as exc:
         reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    assert str(exc.value).startswith(f"{name!r} cannot be stored as a name:")
+    assert "\x1b" not in str(exc.value).replace(repr(name), "")
     assert list(reg.all()) == []
 
 
@@ -204,3 +211,30 @@ def test_a_name_with_an_inner_space_still_works(reg):
     not split, trimmed or escaped by anything on the way back in."""
     fn = reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name="the rank function")
     assert reg.get("the rank function").spec_hash == fn.spec_hash
+
+
+@pytest.mark.parametrize("name,looked_up", [(" ", "''"), ("@a", "'' with version 'a'")])
+def test_a_name_with_no_base_is_refused(reg, name, looked_up):
+    """`" "` and `@a` both split down to an empty base, so no command could ever look
+    them up either — and `get ""` is not a way back in."""
+    with pytest.raises(BadName, match="cannot be stored as a name") as exc:
+        reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    assert f"would be looked up as {looked_up}" in str(exc.value)
+    assert list(reg.all()) == []
+
+
+def test_a_name_stored_before_the_guard_still_takes_new_versions(reg):
+    """The guard is forward-only by design, and that is what makes validating on
+    `save_spec` safe: a function carrying a pre-existing bad name still stores a new
+    version when no new name is given, and a valid rename rescues it."""
+    fn = reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name="rank")
+    meta_path = reg.dir_of(fn.spec_hash) / "spec.json"
+    meta = json.loads(meta_path.read_text())
+    meta["name"] = "a@b"                       # as an earlier version would have written it
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+
+    again = reg.put(REQ, SPEC, CODE + "# v2\n", report(), [])   # no name: must not raise
+    assert [v.name for v in again.versions] == ["v1", "v2"]
+
+    reg.put(REQ, SPEC, CODE + "# v3\n", report(), [], name="rank")   # a valid rename heals it
+    assert reg.get("rank").name == "rank"

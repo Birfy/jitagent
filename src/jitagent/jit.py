@@ -33,7 +33,7 @@ from typing import Any
 from .llm import LLMClient
 from .lookup import Candidate, Lookup, find, search
 from .propose import Proposal, propose_tests
-from .registry import Function, NotCacheable, Registry
+from .registry import Function, NotCacheable, Registry, check_name
 from .runtime import CallOutcome, Runtime, call_function  # noqa: F401  part of the API
 from .sandbox import Sandbox
 from .synth import SynthResult, compile_function as synthesize, spec_for
@@ -244,7 +244,9 @@ def _bank_the_hit(reg: Registry, lk: Lookup, examples: list[Example],
     which makes the next regeneration with a better model that much safer.
     """
     if name and lk.fn.name != name:
-        lk.fn.name = name              # hit someone else's function; label it
+        # Judge the label before adopting it: a caller that catches BadName must not be
+        # left holding a Function whose name nothing can look up.
+        lk.fn.name = check_name(name)
         reg.save_spec(lk.fn)
     # Add them all, then check. any() over a generator short-circuits, so the first
     # success would skip the rest.

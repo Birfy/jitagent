@@ -331,10 +331,10 @@ class Registry:
         fn = self._load(self.dir_of(h)) if (self.dir_of(h) / "spec.json").exists() else None
         if fn is None:
             fn = Function(spec_hash=h, requirement=requirement, spec=spec,
-                          tests=TestSet(), created_at=_now(), name=name)
+                          tests=TestSet(), created_at=_now(), name=check_name(name))
             self.save_spec(fn)
         elif name and fn.name != name:
-            fn.name = name                       # add a name, or rename
+            fn.name = check_name(name)           # add a name, or rename
             self.save_spec(fn)
 
         for ex in examples:
