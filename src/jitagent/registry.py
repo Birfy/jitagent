@@ -94,12 +94,16 @@ def check_name(name: str) -> str:
         return name
     base, version = split_ref(name)
     if version is not None or base != name:
-        read_back = (f"name {base!r} with version {version!r}" if version is not None
-                     else f"name {base!r} once the ends are trimmed")
+        # Name the lookup the parser would actually perform: for `a@` that is name
+        # `a` with no version (the '@' is simply dropped), for `a@b` it is `a` + `b`,
+        # and for ` rank` it is `rank`. Saying "it was trimmed" of `a@` would be wrong.
+        looked_up = (f"{base!r} with version {version!r}" if version is not None
+                     else repr(base))
         raise BadName(
             f"{name!r} cannot be stored as a name: a reference is parsed as "
-            f"<name>[@version], so this one reads back as {read_back} and nothing "
-            "could ever reach it. Drop the '@' and any leading or trailing spaces.")
+            f"<name>[@version], so this one would be looked up as {looked_up}, and "
+            "nothing could ever reach it. Drop the '@' and any leading or trailing "
+            "spaces.")
     if not name.isprintable():
         raise BadName(
             f"{name!r} cannot be stored as a name: it contains a control character, "

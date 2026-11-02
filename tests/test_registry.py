@@ -160,18 +160,24 @@ def test_a_function_without_a_name_falls_back_to_its_handle(reg):
     assert fn.ref == fn.handle
 
 
-
-
 # --- names that no command could type back ---------------------------------
-def test_a_name_with_at_is_refused(reg):
+@pytest.mark.parametrize("name,looked_up", [
+    ("a@b", "'a' with version 'b'"),   # split into name + version
+    ("a@", "'a'"),                     # the '@' is dropped, the version is empty
+    ("a@@b", "'a' with version '@b'"),  # only the first '@' separates
+])
+def test_a_name_with_at_is_refused(reg, name, looked_up):
     """A name is a *reference*, and every command parses one as `<name>[@version]`.
 
     `a@b` was accepted and written to spec.json, after which `get a@b` split it into
     name `a` + version `b`, found no such name, and exited 1. The name supplied by the
     user could never be the name looked up — so the store must not accept it at all.
+    The message has to say which lookup the name would turn into, or it is just a
+    refusal the user cannot act on.
     """
-    with pytest.raises(BadName, match="cannot be stored as a name"):
-        reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name="a@b")
+    with pytest.raises(BadName, match="cannot be stored as a name") as exc:
+        reg.put(REQ, SPEC, CODE, report(), EXAMPLES, name=name)
+    assert f"would be looked up as {looked_up}" in str(exc.value)
     assert list(reg.all()) == [], "a refused name must not leave half a function behind"
 
 
