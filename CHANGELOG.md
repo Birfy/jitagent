@@ -3,6 +3,29 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Export and import
+
+- `jitagent export NAME -o FILE` writes one compiled function to a single JSON bundle:
+  the requirement, the inferred `Spec`, every case with its `origin` and `assumes`, and
+  every version's code and verification report. The format is `jitagent.bundle/1`; keys
+  are sorted and versions are ordered by number, so two exports of one function are
+  byte-identical and a committed bundle diffs as a change to the case set. `-o` writes
+  the file named (saying so when it replaces one); without `-o` the bundle goes to stdout.
+- `jitagent import FILE` loads a bundle on another machine — and **re-verifies it
+  instead of trusting it**: the static check, every case in the bundle and the return
+  schema run in the local sandbox before anything is written. A tampered code or
+  expected value is refused with the failing gate and case, exit 1, and nothing stored.
+- Importing into a registry that already holds the same function merges only what is
+  missing: versions it does not have are added with their `origin`/`assumes` intact and
+  their version numbers preserved; identical versions are skipped, so importing twice
+  changes nothing. A different implementation under an existing version name, or a name
+  another function owns, is refused rather than overwritten.
+- Refusals — unknown format version, malformed JSON, a `spec_hash` that disagrees with
+  the bundle's own contents, a bundle with no versions — are one line on stderr and
+  exit 1, not a traceback.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
