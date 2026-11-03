@@ -5,15 +5,30 @@ No network: the source function is compiled through `ScriptedClient` into a temp
 registry, exported, and imported into a second, empty one. The import side is the part
 worth testing: it runs foreign code, so it re-verifies instead of trusting the file.
 """
+import contextlib
 import json
+import os
+import socket
+import subprocess
+import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from jitagent import Example, Registry, Sandbox
+import pytest
+
+import jitagent
+from jitagent import Example, Registry, Sandbox, lookup
 from jitagent.bundle import FORMAT
 from jitagent.cli import main
+from jitagent.jit import compile_function as compile_with_lookup
 from jitagent.llm import ScriptedClient
+from jitagent.registry import spec_hash
+from jitagent.runtime import _schema_error
 from jitagent.synth import compile_function
+from jitagent.types import Spec
+from jitagent.verify import _schema_ok
 
 REQ = "Count the numbers in {values}."
 CODE = "def solve(params, ctx):\n    return len(params['values'])\n"
@@ -424,3 +439,471 @@ def test_a_refusal_does_not_echo_control_bytes_from_the_bundle(tmp_path, capsys)
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert "\x1b" not in err, "a bundle must not write an ESC byte to the terminal"
+
+
+# --- a bundle's schema must not fetch or read anything ----------------------
+# JSON Schema says "look over there" in three spellings: `$ref`, `$dynamicRef` and
+# `$recursiveRef`. `jsonschema` retrieves `http(s)://` and `file://` targets on demand,
+# so a bundle — an untrusted file — could make the importer fetch a URL or read a path.
+# The pointer is refused when the file is parsed, before any validation runs; the three
+# validation sites also validate against a retriever-less registry, so a schema already
+# on the shelf cannot fetch either.
+#
+# Every case below fails fast on the old code: a listener that answers at once (and
+# counts the GETs), a closed port, or a `file://` path that is absent/unreadable/a
+# directory. None of them waits on a socket — a suite that hangs hides the regression
+# instead of reporting it.
+SRC = Path(jitagent.__file__).resolve().parents[1]
+
+OBJ_REQ = "Summarise the numbers in {values}."
+OBJ_CODE = ("def solve(params, ctx):\n"
+            "    return {'count': len(params['values']), 'values': params['values']}\n")
+OBJ_EXAMPLES = [Example({"values": [1, 2]}, {"count": 2, "values": [1, 2]}),
+                Example({"values": []}, {"count": 0, "values": []}, boundary=True)]
+
+# A field *named* `$ref` is data, not a keyword: `infer._object` builds `properties`
+# from the input's own keys, so a real generated bundle legitimately holds
+# `properties: {"$ref": {...}}`. A "reject any dict with a `$ref` key" walk refuses it.
+REF_FIELD_REQ = "Return the amount in the field named $ref."
+REF_FIELD_CODE = "def solve(params, ctx):\n    return params['amount']\n"
+REF_FIELD_EXAMPLES = [Example({"$ref": "x", "amount": 2}, 2),
+                      Example({"$ref": "y", "amount": 5}, 5)]
+REF_FIELD_NESTED_EXAMPLES = [Example({"$ref": {"$ref": "a"}, "amount": 2}, 2),
+                             Example({"$ref": {"$ref": "bb"}, "amount": 5}, 5)]
+
+L2_REQ = REQ + " Please answer once more."
+
+
+def with_return_schema(schema):
+    def edit(data):
+        data["function"]["spec"]["return_schema"] = schema
+
+    return edit
+
+
+def with_param_schema(schema):
+    def edit(data):
+        data["function"]["spec"]["param_schema"] = schema
+
+    return edit
+
+
+def repack(tmp_path, reg, edit, filename, name="rank", rehash=True):
+    """Export, tamper, and re-declare the `spec_hash` the tampering changed.
+
+    Without the rehash the existing `spec_hash` check refuses first, and a test of a
+    *new* refusal has to get past that check to mean anything.
+    """
+    path = tmp_path / filename
+    assert run(reg.root, "export", name, "-o", str(path)) == 0
+    data = json.loads(path.read_text())
+    edit(data)
+    if rehash:
+        spec = Spec.from_dict(data["function"]["spec"])
+        data["function"]["spec_hash"] = spec_hash(data["function"]["requirement"], spec)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def refusal(capsys, home, path, expect=()):
+    """Import refused: rc 1, one stderr line, no traceback, nothing written."""
+    capsys.readouterr()
+    assert run(home, "import", str(path)) == 1
+    out, err = capsys.readouterr()
+    assert "Traceback" not in err, err
+    assert err.strip(), "a refusal must say why"
+    assert err.count("\n") == 1, err
+    assert out == "", out
+    if expect:
+        assert any(w in err or w.lower() in err.lower() for w in expect), (expect, err)
+    assert stored(home) == [], "a refused bundle must not be written"
+
+
+def closed_port():
+    """A 127.0.0.1 port nothing listens on: connecting is refused immediately."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+@contextlib.contextmanager
+def counting_http(status=404):
+    """A local endpoint that records every GET it serves, so "no fetch" is assertable.
+
+    It answers immediately: a test that could hang is a test CI cannot use.
+    """
+    hits = []
+    payload = b'{"type": "integer"}'
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/schema.json", hits
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_import_refuses_a_return_schema_ref_to_a_file(tmp_path, capsys):
+    """The target's contents — and its existence — are irrelevant: it is never read."""
+    reg, _ = build(tmp_path / "one")
+    fresh = tmp_path / "fresh"
+    secret = tmp_path / "secret.json"
+
+    def refuse(schema, filename):
+        path = repack(tmp_path, reg, with_return_schema(schema), filename)
+        refusal(capsys, fresh, path, expect=("$ref", "reference"))
+
+    secret.write_text('{"type": "integer"}')
+    refuse({"$ref": secret.as_uri()}, "file-ref-int.jit.json")
+    secret.write_text('{"type": "string"}')
+    refuse({"$ref": secret.as_uri()}, "file-ref-string.jit.json")
+    refuse({"$ref": (tmp_path / "does-not-exist.json").as_uri()},
+           "file-ref-missing.jit.json")
+    directory = tmp_path / "schema-dir"
+    directory.mkdir()
+    refuse({"$ref": directory.as_uri()}, "file-ref-directory.jit.json")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads through mode 000")
+def test_import_refuses_a_ref_to_a_file_without_read_permission(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    secret = tmp_path / "secret.json"
+    secret.write_text('{"type": "integer"}')
+    secret.chmod(0o000)
+    try:
+        path = repack(tmp_path, reg, with_return_schema({"$ref": secret.as_uri()}),
+                      "file-ref-unreadable.jit.json")
+        refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+    finally:
+        secret.chmod(0o644)
+
+
+def test_import_refuses_a_ref_to_a_closed_http_port(tmp_path, capsys):
+    """Connection refused is the fast shape of "the importer followed the pointer"."""
+    reg, _ = build(tmp_path / "one")
+    ref = f"http://127.0.0.1:{closed_port()}/schema.json"
+    path = repack(tmp_path, reg, with_return_schema({"$ref": ref}), "closed-ref.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+
+
+def test_import_refuses_a_ref_nested_under_properties(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one", requirement=OBJ_REQ, examples=OBJ_EXAMPLES,
+                   code=OBJ_CODE)
+    secret = tmp_path / "int.json"
+    secret.write_text('{"type": "integer"}')
+
+    def edit(data):
+        data["function"]["spec"]["return_schema"]["properties"]["count"] = {
+            "$ref": secret.as_uri()}
+
+    path = repack(tmp_path, reg, edit, "nested-properties.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+
+
+def test_import_refuses_a_ref_nested_under_items(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one", requirement=OBJ_REQ, examples=OBJ_EXAMPLES,
+                   code=OBJ_CODE)
+    secret = tmp_path / "int.json"
+    secret.write_text('{"type": "integer"}')
+
+    def edit(data):
+        data["function"]["spec"]["return_schema"]["properties"]["values"]["items"] = {
+            "$ref": secret.as_uri()}
+
+    path = repack(tmp_path, reg, edit, "nested-items.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+
+
+def test_import_refuses_a_ref_inside_an_all_of_list(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one", requirement=OBJ_REQ, examples=OBJ_EXAMPLES,
+                   code=OBJ_CODE)
+    secret = tmp_path / "object.json"
+    secret.write_text('{"type": "object"}')
+
+    def edit(data):
+        original = data["function"]["spec"]["return_schema"]
+        data["function"]["spec"]["return_schema"] = {
+            "allOf": [original, {"$ref": secret.as_uri()}]}
+
+    path = repack(tmp_path, reg, edit, "all-of-ref.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+
+
+def test_import_refuses_a_dynamic_ref(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    secret = tmp_path / "int.json"
+    secret.write_text('{"type": "integer"}')
+    path = repack(tmp_path, reg, with_return_schema({"$dynamicRef": secret.as_uri()}),
+                  "dynamic-ref.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$dynamicRef", "reference"))
+
+
+def test_import_refuses_a_recursive_ref(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    secret = tmp_path / "int.json"
+    secret.write_text('{"type": "integer"}')
+    path = repack(tmp_path, reg, with_return_schema({"$recursiveRef": secret.as_uri()}),
+                  "recursive-ref.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$recursiveRef", "reference"))
+
+
+def test_import_refuses_a_ref_in_the_param_schema(tmp_path, capsys):
+    """Import never validates `param_schema`, so only a parse-time walk can see this."""
+    reg, _ = build(tmp_path / "one")
+    secret = tmp_path / "object.json"
+    secret.write_text('{"type": "object"}')
+    path = repack(tmp_path, reg, with_param_schema({"$ref": secret.as_uri()}),
+                  "param-ref.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+
+
+def test_import_refuses_a_ref_hidden_in_unreferenced_defs(tmp_path, capsys):
+    """Nothing points at `$defs`, so the pointer is never resolved here — and it is
+    still a fetch instruction a foreign file could later point at."""
+    reg, _ = build(tmp_path / "one")
+    missing = (tmp_path / "nope.json").as_uri()
+    path = repack(tmp_path, reg, with_return_schema(
+        {"$defs": {"x": {"$ref": missing}}, "type": "integer"}), "defs-ref.jit.json")
+    refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+
+
+def test_import_never_fetches_a_ref_over_http(tmp_path, capsys):
+    """A refused bundle must not have touched the listener, not even a HEAD."""
+    reg, _ = build(tmp_path / "one")
+    fresh = tmp_path / "fresh"
+    with counting_http() as (url, hits):
+        path = repack(tmp_path, reg, with_return_schema({"$ref": url}), "http-ref.jit.json")
+        capsys.readouterr()
+        raised, rc = "", None
+        try:
+            rc = run(fresh, "import", str(path))
+        except Exception as exc:          # 845453f: retrieval raises out of the CLI
+            raised = f"{type(exc).__name__}: {exc}"
+        out, err = capsys.readouterr()
+    assert hits == [], f"the importer fetched {hits}"
+    assert not raised, raised
+    assert rc == 1, (rc, out, err)
+    assert "Traceback" not in err and err.strip() and err.count("\n") == 1, err
+    assert out == ""
+    assert stored(fresh) == []
+
+
+def test_the_three_validation_sites_do_not_fetch_a_ref():
+    """verify/runtime/lookup each validate a value against a schema; none may fetch."""
+    with counting_http() as (url, hits):
+        for check in (_schema_ok, _schema_error, lookup._fits):
+            before = len(hits)
+            start = time.monotonic()
+            raised, message = "", ""
+            try:
+                message = check(3, {"$ref": url})
+            except Exception as exc:      # 845453f: retrieval raises out of the guard
+                raised = f"{type(exc).__name__}: {exc}"
+            elapsed = time.monotonic() - start
+            assert len(hits) == before, f"{check.__name__} fetched {hits[before:]}"
+            assert not raised, f"{check.__name__} raised {raised}"
+            assert isinstance(message, str) and message, (check.__name__, message)
+            assert elapsed < 2, f"{check.__name__} took {elapsed:.1f}s"
+
+
+def test_call_guards_a_hand_edited_param_schema_ref(tmp_path, capsys):
+    """The args guard (`runtime._schema_error`) is the first site a `call` reaches.
+
+    Import refuses a `$ref` bundle, so the registry is hand-edited here — the state a
+    pre-fix import (or a foreign registry) leaves behind. `cmd_call` prints
+    `CallOutcome.render()` to stdout, so the one guard line is on stdout; what must not
+    appear is a traceback or a wait.
+    """
+    reg, fn = build(tmp_path / "one")
+    spec_path = Path(reg.root) / fn.spec_hash / "spec.json"
+    original = json.loads(spec_path.read_text())
+    with counting_http() as (url, hits):
+        for field in ("param_schema", "return_schema"):
+            before = len(hits)
+            meta = json.loads(json.dumps(original))
+            meta["spec"][field] = {"$ref": url}
+            spec_path.write_text(json.dumps(meta))
+            capsys.readouterr()
+            raised, rc = "", None
+            try:
+                rc = run(reg.root, "call", "rank", json.dumps({"values": [1, 2]}))
+            except Exception as exc:      # 845453f: retrieval raises out of the CLI
+                raised = f"{type(exc).__name__}: {exc}"
+            out, err = capsys.readouterr()
+            assert len(hits) == before, f"{field}: the guard fetched {hits[before:]}"
+            assert not raised, f"{field}: {raised}"
+            assert rc == 1, (field, rc, out, err)
+            assert "Traceback" not in out + err, (field, out, err)
+            assert len(out.splitlines()) == 1, (field, out)
+            assert ("guard_failed" in out) or ("postcondition_failed" in out), (field, out)
+    spec_path.write_text(json.dumps(original))
+
+
+def test_lookup_rejects_a_hand_edited_ref_before_synthesising(tmp_path):
+    """L2 (`compile` -> `find` -> `schema_compatible` -> `_fits`) must not fetch.
+
+    A candidate that arrived through an import can carry a schema the importer should
+    have refused; the look-up layer has to answer without following the pointer, and a
+    miss is the right answer — synthesis is the fallback.
+    """
+    reg, fn = build(tmp_path / "one")
+    bundle = tmp_path / "rank.jit.json"
+    assert run(reg.root, "export", "rank", "-o", str(bundle)) == 0
+    imported = tmp_path / "two"
+    assert run(imported, "import", str(bundle)) == 0
+
+    meta_path = Path(imported) / fn.spec_hash / "spec.json"
+    examples = [Example({"values": [1, 2, 3]}, 3)]
+    with counting_http() as (url, hits):
+        meta = json.loads(meta_path.read_text())
+        meta["spec"]["param_schema"] = {"$ref": url}
+        meta_path.write_text(json.dumps(meta))
+        start = time.monotonic()
+        raised, result = "", None
+        try:
+            result = compile_with_lookup(L2_REQ, examples, client=ScriptedClient([CODE]),
+                                         registry=Registry(imported), sandbox=Sandbox(),
+                                         gen_tests=0)
+        except Exception as exc:          # 845453f: retrieval raises out of the search
+            raised = f"{type(exc).__name__}: {exc}"
+        elapsed = time.monotonic() - start
+    assert hits == [], f"the L2 schema check fetched {hits}"
+    assert not raised, raised
+    assert elapsed < 20, f"the L2 schema check blocked {elapsed:.1f}s"
+    assert result.status == "ready", result.render()
+    assert result.lookup is not None
+    assert result.lookup.level == "miss", result.lookup.render()
+    candidates = result.lookup.candidates
+    assert candidates, "the candidate must still be reported"
+    assert candidates[0].verdict == "schema", candidates[0].why
+    assert candidates[0].why, "a rejected candidate has to say why"
+
+
+def test_a_field_named_ref_is_a_property_not_a_schema_keyword(tmp_path, capsys):
+    """A real generated bundle may hold `properties: {"$ref": {...}}` — data, not a keyword.
+
+    A walk that refuses any dict with a `$ref` key refuses this bundle; the walk has to
+    enter schema positions only.
+    """
+    reg, fn = build(tmp_path / "one", requirement=REF_FIELD_REQ,
+                    examples=REF_FIELD_EXAMPLES, code=REF_FIELD_CODE)
+    path = exported(tmp_path, reg)
+    fresh = tmp_path / "two"
+    assert run(fresh, "import", str(path)) == 0
+    capsys.readouterr()
+    assert stored(fresh) == [fn.spec_hash]
+    assert run(fresh, "call", "rank", json.dumps({"$ref": "z", "amount": 7})) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "7"
+
+
+def test_a_nested_field_named_ref_is_still_a_property(tmp_path, capsys):
+    """The value under `properties` is a schema, and it may itself have a `$ref`-named
+    property: the walk has to descend into schema positions at every depth without
+    mistaking a property name for a keyword."""
+    reg, fn = build(tmp_path / "one", requirement=REF_FIELD_REQ,
+                    examples=REF_FIELD_NESTED_EXAMPLES, code=REF_FIELD_CODE)
+    path = exported(tmp_path, reg)
+    fresh = tmp_path / "two"
+    assert run(fresh, "import", str(path)) == 0
+    capsys.readouterr()
+    assert stored(fresh) == [fn.spec_hash]
+    assert run(fresh, "call", "rank",
+               json.dumps({"$ref": {"$ref": "zz"}, "amount": 9})) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "9"
+
+
+# --- text this machine cannot store -----------------------------------------
+# A lone surrogate (`"\ud800"`) is legal JSON and not encodable as UTF-8. It used to die
+# inside `spec_hash` (requirement) or halfway through `adopt()` (created_at, a case's
+# note/assumes), after the `fn_…` directory existed: a traceback, not a refusal, and a
+# half-written function left behind.
+def test_import_refuses_a_lone_surrogate_in_the_requirement(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    data["function"]["requirement"] = "Count \ud800 {values}."
+    path.write_text(json.dumps(data))      # ensure_ascii: the lone surrogate stays JSON
+    refusal(capsys, tmp_path / "fresh", path)
+
+
+def test_import_refuses_a_lone_surrogate_in_created_at(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    data["function"]["created_at"] = "2026-11-03T00:00:00\ud800"
+    path.write_text(json.dumps(data))
+    refusal(capsys, tmp_path / "fresh", path)
+
+
+def test_import_refuses_a_lone_surrogate_in_a_case_field(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    for key in ("assumes", "note"):
+        data = json.loads(path.read_text())
+        data["tests"]["examples"][0][key] = "rests on \ud800"
+        bad = tmp_path / f"case-{key}.jit.json"
+        bad.write_text(json.dumps(data))
+        refusal(capsys, tmp_path / f"fresh-{key}", bad)
+
+
+# --- the store is UTF-8 whatever the process locale is -----------------------
+def test_a_cjk_bundle_imports_under_a_non_utf8_locale(tmp_path):
+    """`_write` used the platform default, so under an ASCII locale a valid CJK bundle
+    died halfway through storing it. Python's UTF-8 mode is disabled explicitly: a bare
+    `LC_ALL=C` makes Python 3.11+ enter UTF-8 mode, which would hide the bug."""
+    reg, fn = build(tmp_path / "one", requirement=NON_ASCII_REQ,
+                    examples=NON_ASCII_EXAMPLES, name="count")
+    bundle = tmp_path / "count.jit.json"
+    assert run(reg.root, "export", "count", "-o", str(bundle)) == 0
+    fresh = tmp_path / "fresh"
+
+    env = dict(os.environ)
+    env.update({"LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0",
+                "PYTHONCOERCECLOCALE": "0", "PYTHONIOENCODING": "utf-8"})
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(SRC)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    proc = subprocess.run([sys.executable, "-m", "jitagent.cli", "--home", str(fresh),
+                           "import", str(bundle)],
+                          capture_output=True, text=True, env=env, timeout=180)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "Traceback" not in proc.stderr, proc.stderr
+    assert "codec" not in proc.stderr.lower(), proc.stderr
+    assert stored(fresh) == [fn.spec_hash]
+    meta = json.loads((Path(fresh) / fn.spec_hash / "spec.json").read_bytes()
+                      .decode("utf-8"))
+    assert meta["requirement"] == NON_ASCII_REQ
+    cases = (Path(fresh) / fn.spec_hash / "tests.json").read_bytes().decode("utf-8")
+    assert "一" in cases, "the CJK case values must survive as UTF-8"
+
+
+# --- the hash comparison is a pin, not a new rule ---------------------------
+def test_import_refuses_a_bundle_whose_spec_hash_was_changed(tmp_path, capsys):
+    """Pins the existing whole-file check: recomputing the hash is not optional.
+
+    This one is green before the fix by design; it is here so the commit that adds the
+    `$ref` walk cannot weaken the check it sits next to.
+    """
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    real = data["function"]["spec_hash"]
+    data["function"]["spec_hash"] = real[:-1] + ("0" if real[-1] != "0" else "1")
+    path.write_text(json.dumps(data))
+    refusal(capsys, tmp_path / "fresh", path, expect=("spec_hash", "does not match"))

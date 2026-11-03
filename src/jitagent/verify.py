@@ -29,10 +29,19 @@ from dataclasses import dataclass
 from typing import Any
 
 import jsonschema
+import referencing
+from referencing.exceptions import Unresolvable, Unretrievable
 
 from . import static_check
 from .sandbox import RunResult, Sandbox
 from .types import Example, GateResult, Level, Report, Spec, deep_equal
+
+
+# No store and no retriever: a `$ref` that names another file or URL cannot be
+# resolved, so validation fails instead of fetching. A schema here can come from a
+# bundle, which is a file someone handed us, and a URL means `urlopen` with no
+# timeout. One immutable registry, shared by every call.
+_REGISTRY = referencing.Registry()
 
 
 @dataclass
@@ -44,12 +53,16 @@ class Thresholds:
 
 def _schema_ok(value: Any, schema: dict) -> str:
     try:
-        jsonschema.validate(value, schema)
+        jsonschema.validate(value, schema, registry=_REGISTRY)
         return ""
     except jsonschema.ValidationError as e:
         return f"{'/'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}"
     except jsonschema.SchemaError as e:
         return f"the schema itself is invalid: {e.message}"
+    except (Unresolvable, Unretrievable):
+        # jsonschema wraps these (`_WrappedReferencingError` is a subclass of
+        # Unresolvable, which is why that one class covers a URL and a local pointer).
+        return "the schema points at another file or URL, which this machine does not follow"
 
 
 def _failures(run: RunResult, examples: list[Example]) -> list[dict]:

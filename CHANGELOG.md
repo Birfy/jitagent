@@ -35,6 +35,17 @@ is 0, the API may change in a minor release.
   verification, requires a printable name without `@` that a command can look up again,
   and bounds version names so no entry can overflow a path or an `int`. Pathological
   files — deeply nested JSON, absurd versions — are one line and exit 1, not a traceback.
+- A bundle's JSON Schemas cannot point outside the file. `import` refuses `$ref`,
+  `$dynamicRef` and `$recursiveRef` anywhere in `param_schema` or `return_schema` — nested
+  under `properties`, `items` or `allOf` included — as one line, and every place that applies
+  a schema validates against a registry with no retriever, so a bundle can never make the
+  importer fetch a URL, read a local file, or stall in `urlopen` (which has no timeout).
+  Schemas this tool generates contain no references, so no bundle `jitagent export` writes
+  is refused.
+- Everything a bundle stores is UTF-8: a lone surrogate in the requirement, name,
+  `created_at`, `assumes` or a case value is refused at parse with one line instead of
+  failing inside the registry write, and the registry reads and writes UTF-8, so a
+  non-ASCII bundle still imports on a machine whose locale is ASCII.
 
 ## [0.0.1] — 2026-09-16
 

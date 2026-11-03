@@ -25,9 +25,16 @@ from dataclasses import dataclass
 from typing import Any
 
 import jsonschema
+import referencing
+from referencing.exceptions import Unresolvable, Unretrievable
 
 from .registry import Function, Registry, Version, split_ref
 from .sandbox import CallResult, RunResult, Sandbox
+
+# No store and no retriever: a `$ref` that names another file or URL cannot be
+# resolved, so validation fails instead of fetching. A stored spec can have arrived
+# in a bundle, and a schema that points at a URL is `urlopen` with no timeout.
+_REGISTRY = referencing.Registry()
 
 # How many calls share one sandbox process. Bigger saves startup; smaller makes the
 # replay cheaper when a batch dies.
@@ -53,12 +60,15 @@ class UnknownHandle(KeyError):
 
 def _schema_error(value: Any, schema: dict) -> str:
     try:
-        jsonschema.validate(value, schema)
+        jsonschema.validate(value, schema, registry=_REGISTRY)
         return ""
     except jsonschema.ValidationError as e:
         return f"{'/'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}"
     except jsonschema.SchemaError as e:
         return f"the schema itself is invalid: {e.message}"
+    except (Unresolvable, Unretrievable):
+        # jsonschema raises `_WrappedReferencingError`, a subclass of Unresolvable.
+        return "the schema points at another file or URL, which this machine does not follow"
 
 
 class Runtime:

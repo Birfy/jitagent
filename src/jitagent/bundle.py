@@ -57,6 +57,18 @@ class BadBundle(ValueError):
     """
 
 
+# A schema that names another document is not a contract this importer can honour: the
+# target can be a URL (or a file path) that this machine would then fetch or read. JSON
+# Schema has three spellings of "look over there", so all three are refused.
+_REF_KEYS = ("$ref", "$dynamicRef", "$recursiveRef")
+
+# The store writes UTF-8. JSON lets a file carry a lone surrogate (`"\ud800"`), which no
+# UTF-8 encoder will accept; it would otherwise die inside `spec_hash` or halfway through
+# `adopt()`, after the directory existed.
+_LONE_SURROGATE = ("the bundle contains text this machine cannot store (a lone surrogate) "
+                   "— nothing was imported")
+
+
 def _kind(value: Any) -> str:
     if value is None:
         return "null"
@@ -69,6 +81,50 @@ def _kind(value: Any) -> str:
     if isinstance(value, list):
         return "an array"
     return "an object"
+
+
+# A schema may hold a subschema only in these positions — and these are *positions*, not
+# names. `infer._object` builds `properties` from the data's own keys, so a function whose
+# input has a field called `$ref` legitimately produces `properties: {"$ref": {...}}`
+# (there the `$ref` is a property name, not a keyword). A recursive "any dict with a
+# `$ref` key" check would refuse a real bundle; only these keywords are entered.
+_SCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_SCHEMA_ONE = ("items", "additionalItems", "additionalProperties", "not", "if", "then",
+               "else", "contains", "propertyNames", "unevaluatedItems",
+               "unevaluatedProperties")
+_SCHEMA_MANY = ("allOf", "anyOf", "oneOf", "prefixItems")
+
+
+def _ref_path(schema: Any, where: str) -> tuple[str, str] | None:
+    """The path of the first schema object that holds a `$ref`-family keyword, and which
+    keyword, or None when the schema stands on its own.
+
+    Iterative, and only the positions above are entered: the nesting is the file author's,
+    so recursion here would put a `RecursionError` back in the middle of the one-line
+    promise. Nothing is resolved, fetched or imported — the pointer is only located.
+    """
+    stack = [(schema, where)]
+    while stack:
+        node, at = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        for key in node:
+            if key in _REF_KEYS:
+                return at, key
+        for key, child in node.items():
+            if key in _SCHEMA_MAPS and isinstance(child, dict):
+                for name, sub in child.items():
+                    stack.append((sub, f"{at}.{key}.{name}"))
+            elif key in _SCHEMA_ONE:
+                if isinstance(child, dict):
+                    stack.append((child, f"{at}.{key}"))
+                elif isinstance(child, list):     # draft-04 tuple form of `items`
+                    for i, sub in enumerate(child):
+                        stack.append((sub, f"{at}.{key}[{i}]"))
+            elif key in _SCHEMA_MANY and isinstance(child, list):
+                for i, sub in enumerate(child):
+                    stack.append((sub, f"{at}.{key}[{i}]"))
+    return None
 
 
 def to_dict(fn: Function) -> dict[str, Any]:
@@ -140,6 +196,20 @@ def from_dict(data: Any) -> Function:
         raise BadBundle(f'"function.spec" is not a spec: {e}') from None
     if not isinstance(spec.entry, str) or not spec.entry.isidentifier():
         raise BadBundle('"function.spec.entry" must be a Python identifier')
+
+    # A bundle's schema is supposed to be self-contained, but `jsonschema` resolves a
+    # `$ref` on demand: a URL means `urlopen` with no timeout, a path means a local read.
+    # That is not a thing a file someone handed us may do to this machine, so the pointer
+    # is refused when the bundle is parsed — the runtime's retriever-less registry is the
+    # second layer, not a substitute for this one.
+    for field in ("param_schema", "return_schema"):
+        found = _ref_path(getattr(spec, field), f"function.spec.{field}")
+        if found is not None:
+            where, key = found
+            raise BadBundle(
+                f'"{where}" uses "{key}"; a bundle\'s schema must be self-contained and '
+                "may not point at another file or URL")
+
     # The spec names the resource limits the *verifier* will hand to the sandbox. A bundle
     # is untrusted, so an unbounded `timeout_ms` (or a huge `mem_mb`, which disarms both
     # RLIMIT_AS and the watchdog) would let one file stall the importer indefinitely.
@@ -154,7 +224,14 @@ def from_dict(data: Any) -> Function:
     # here rather than believed: a bundle whose hash disagrees with its own contents is
     # the one thing an importer must never store, because it would shadow another
     # function's directory.
-    computed = spec_hash(requirement, spec)
+    #
+    # `spec_hash` hashes the requirement and the schemas as UTF-8, so a lone surrogate
+    # (`"\ud800"`: legal JSON, not encodable) dies there — before the whole-file gate
+    # below can see it. Same one line either way.
+    try:
+        computed = spec_hash(requirement, spec)
+    except UnicodeEncodeError:
+        raise BadBundle(_LONE_SURROGATE) from None
     declared = meta.get("spec_hash")
     if declared != computed:
         raise BadBundle(
@@ -180,6 +257,13 @@ def from_dict(data: Any) -> Function:
                   tests=TestSet(examples=_examples(data.get("tests"))),
                   versions=_versions(data.get("versions")),
                   created_at=created_at, name=name)
+    # The store writes this file back out as UTF-8. Refuse here, while nothing has been
+    # written, rather than in the middle of `adopt()` with an empty `fn_…` directory
+    # already on disk — and rather than as a traceback from `code.py`.
+    try:
+        json.dumps(to_dict(fn), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        raise BadBundle(_LONE_SURROGATE) from None
     return fn
 
 

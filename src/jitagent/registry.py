@@ -168,7 +168,10 @@ def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
     try:
-        with os.fdopen(fd, "w") as fh:
+        # The stored text is UTF-8 whatever the process locale is: under `LC_ALL=C` the
+        # default is ASCII, and a valid CJK bundle died here *after* its directory was
+        # made. A bundle can be imported on a machine whose locale is not ours.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, path)
     except BaseException:
@@ -226,7 +229,7 @@ class Registry:
         if not name:
             return None
         for d in self._dirs():
-            meta = json.loads((d / "spec.json").read_text())
+            meta = json.loads((d / "spec.json").read_text(encoding="utf-8"))
             if meta.get("name") == name:
                 return self._load(d)
         return None
@@ -241,20 +244,21 @@ class Registry:
         return (d for d in sorted(self.root.iterdir()) if (d / "spec.json").exists())
 
     def _load(self, d: Path) -> Function:
-        meta = json.loads((d / "spec.json").read_text())
-        tests = TestSet.from_dict(json.loads((d / "tests.json").read_text())
+        meta = json.loads((d / "spec.json").read_text(encoding="utf-8"))
+        tests = TestSet.from_dict(json.loads((d / "tests.json").read_text(encoding="utf-8"))
                                   if (d / "tests.json").exists() else {})
         versions = []
         for vd in sorted(d.glob("v*"), key=lambda p: int(p.name[1:]) if p.name[1:].isdigit() else 0):
             if not (vd / "meta.json").exists():
                 continue
-            vm = json.loads((vd / "meta.json").read_text())
+            vm = json.loads((vd / "meta.json").read_text(encoding="utf-8"))
             report = None
             if (vd / "report.json").exists():
-                report = Report.from_dict(json.loads((vd / "report.json").read_text()))
+                report = Report.from_dict(
+                    json.loads((vd / "report.json").read_text(encoding="utf-8")))
             versions.append(Version(
                 name=vm["name"], level=Level(vm["level"]),
-                code=(vd / "code.py").read_text(), report=report,
+                code=(vd / "code.py").read_text(encoding="utf-8"), report=report,
                 created_at=vm.get("created_at", ""), model=vm.get("model", ""),
                 attempts=vm.get("attempts", 1),
                 input_tokens=vm.get("input_tokens", 0),
