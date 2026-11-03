@@ -471,6 +471,14 @@ REF_FIELD_EXAMPLES = [Example({"$ref": "x", "amount": 2}, 2),
 REF_FIELD_NESTED_EXAMPLES = [Example({"$ref": {"$ref": "a"}, "amount": 2}, 2),
                              Example({"$ref": {"$ref": "bb"}, "amount": 5}, 5)]
 
+# A map-like input has no fixed keys, so `infer._object` emits
+# `{"type": "object", "additionalProperties": true}` — a boolean in a schema position.
+# That is what a real generated bundle looks like for map input; the walk must skip it,
+# not refuse it (it only pushes a child that is a dict).
+MAP_REQ = "Count the keys in {m}."
+MAP_CODE = "def solve(params, ctx):\n    return len(params['m'])\n"
+MAP_EXAMPLES = [Example({"m": {}}, 0), Example({"m": {}}, 0, boundary=True)]
+
 L2_REQ = REQ + " Please answer once more."
 
 
@@ -827,6 +835,34 @@ def test_a_nested_field_named_ref_is_still_a_property(tmp_path, capsys):
     assert run(fresh, "call", "rank",
                json.dumps({"$ref": {"$ref": "zz"}, "amount": 9})) == 0
     assert capsys.readouterr().out.splitlines()[-1] == "9"
+
+
+def test_a_map_like_example_exports_and_imports_with_a_boolean_subschema(tmp_path, capsys):
+    """A produced bundle can carry `additionalProperties: true`; the walk must not refuse it.
+
+    `infer._object` emits a boolean when it decides an object is map-like and the values
+    yield nothing (`infer(vals) if vals else True`). The walk only pushes a child that is
+    a dict, so a boolean at `additionalProperties` is skipped, not refused — refusing it
+    would refuse a real generated bundle for a map-like input.
+    """
+    reg, fn = build(tmp_path / "one", requirement=MAP_REQ, examples=MAP_EXAMPLES,
+                    code=MAP_CODE)
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    schema = data["function"]["spec"]["param_schema"]
+    assert schema["properties"]["m"]["additionalProperties"] is True
+
+    fresh = tmp_path / "two"
+    capsys.readouterr()
+    assert run(fresh, "import", str(path)) == 0
+    out, err = capsys.readouterr()
+    assert "Traceback" not in out + err, (out, err)
+    assert stored(fresh) == [fn.spec_hash]
+
+    assert run(fresh, "call", "rank", json.dumps({"m": {"a": 1, "b": 2}})) == 0
+    out, err = capsys.readouterr()
+    assert "Traceback" not in out + err, (out, err)
+    assert out.splitlines()[-1] == "2"
 
 
 # --- a schema is an object, and the walk has a floor ------------------------
