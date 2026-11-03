@@ -840,7 +840,7 @@ def test_import_refuses_a_lone_surrogate_in_the_requirement(tmp_path, capsys):
     data = json.loads(path.read_text())
     data["function"]["requirement"] = "Count \ud800 {values}."
     path.write_text(json.dumps(data))      # ensure_ascii: the lone surrogate stays JSON
-    refusal(capsys, tmp_path / "fresh", path)
+    refusal(capsys, tmp_path / "fresh", path, expect=("surrogate", "cannot store"))
 
 
 def test_import_refuses_a_lone_surrogate_in_created_at(tmp_path, capsys):
@@ -849,7 +849,7 @@ def test_import_refuses_a_lone_surrogate_in_created_at(tmp_path, capsys):
     data = json.loads(path.read_text())
     data["function"]["created_at"] = "2026-11-03T00:00:00\ud800"
     path.write_text(json.dumps(data))
-    refusal(capsys, tmp_path / "fresh", path)
+    refusal(capsys, tmp_path / "fresh", path, expect=("surrogate", "cannot store"))
 
 
 def test_import_refuses_a_lone_surrogate_in_a_case_field(tmp_path, capsys):
@@ -860,7 +860,7 @@ def test_import_refuses_a_lone_surrogate_in_a_case_field(tmp_path, capsys):
         data["tests"]["examples"][0][key] = "rests on \ud800"
         bad = tmp_path / f"case-{key}.jit.json"
         bad.write_text(json.dumps(data))
-        refusal(capsys, tmp_path / f"fresh-{key}", bad)
+        refusal(capsys, tmp_path / f"fresh-{key}", bad, expect=("surrogate", "cannot store"))
 
 
 # --- the store is UTF-8 whatever the process locale is -----------------------
