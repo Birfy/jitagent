@@ -344,10 +344,19 @@ class Registry:
                     f"the name {fn.name!r} is already taken by {other.handle} "
                     f"({other.requirement[:40]}) — nothing was imported")
             return
-        if fn.name and existing.name and existing.name != fn.name:
-            raise NameTaken(
-                f"{existing.ref} is already stored as {existing.name!r} and the bundle "
-                f"calls it {fn.name!r} — one function, one name; nothing was imported")
+        if fn.name and fn.name != existing.name:
+            # The name is being adopted, not merely compared, so it has to be free.
+            # Checking ownership only when `existing` already carried a name let a nameless
+            # stored function take a name a third function owned; `get`/`call` then quietly
+            # resolved to the newcomer.
+            if existing.name:
+                raise NameTaken(
+                    f"{existing.ref} is already stored as {existing.name!r} and the bundle "
+                    f"calls it {fn.name!r} — one function, one name; nothing was imported")
+            if (other := self.by_name(fn.name)) is not None:
+                raise NameTaken(
+                    f"the name {fn.name!r} is already taken by {other.handle} "
+                    f"({other.requirement[:40]}) — nothing was imported")
         for v in fn.versions:
             cur = existing.version(v.name)
             if cur is not None and cur.code.strip() != v.code.strip():

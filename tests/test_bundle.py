@@ -248,6 +248,41 @@ def test_import_refuses_a_name_another_function_already_owns(tmp_path, capsys):
     assert names == ["rank"], "the function already there must be untouched"
 
 
+def test_import_refuses_a_name_another_function_owns_even_if_this_one_is_nameless(
+        tmp_path, capsys):
+    """The merge path must check the name it is about to *adopt*, not only a stored one.
+
+    A bundle can name a function that is already stored here without a name. Checking
+    ownership only when the stored function already had a name let that nameless function
+    take a name a third function owned, and then `get`/`call rank` silently resolved to
+    the newcomer — the exact "no silent overwrite" this import promises.
+    """
+    home = tmp_path / "one"
+    reg, fn = build(home, name="")
+    nameless = tmp_path / "nameless.jit.json"
+    assert run(reg.root, "export", fn.handle, "-o", str(nameless)) == 0
+    build(home, name="rank")  # the same function, now carrying the name
+    named = tmp_path / "rank.jit.json"
+    assert run(reg.root, "export", "rank", "-o", str(named)) == 0
+
+    fresh = tmp_path / "two"
+    assert run(fresh, "import", str(nameless)) == 0
+    capsys.readouterr()
+    build(fresh, requirement=OTHER_REQ, examples=OTHER_EXAMPLES, code=OTHER_CODE)
+    capsys.readouterr()
+
+    assert run(fresh, "import", str(named)) == 1
+    err = capsys.readouterr().err
+    assert "rank" in err and "Traceback" not in err and err.count("\n") == 1
+
+    assert run(fresh, "call", "rank", json.dumps({"values": [1, 2, 3]})) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[-1] == "6", "the name must still mean the function it meant before"
+    names = sorted(json.loads((Path(fresh) / h / "spec.json").read_text()).get("name")
+                   for h in stored(fresh))
+    assert names == ["", "rank"], "the refused bundle must have changed nothing"
+
+
 def test_import_merges_only_the_versions_and_cases_it_lacks(tmp_path, capsys):
     home = tmp_path / "one"
     reg, fn = build(home)
