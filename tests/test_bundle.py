@@ -829,6 +829,171 @@ def test_a_nested_field_named_ref_is_still_a_property(tmp_path, capsys):
     assert capsys.readouterr().out.splitlines()[-1] == "9"
 
 
+# --- a schema is an object, and the walk has a floor ------------------------
+# The `$ref` walk above is iterative, but until now nothing said a schema *is* an object,
+# or how deep a file may nest. So `return_schema: 5` reached `jsonschema` as a
+# `TypeError` out of `main`, `param_schema: 5` imported cleanly and every later `call`
+# died, and a deeply nested file turned into a `RecursionError` after verification had
+# already run. Objects only, and at most 64 nested schema objects: both are parse-time
+# refusals, before anything is written.
+def nested_schema(levels):
+    """A schema `levels` objects deep: a leaf that accepts the example output, wrapped
+    `levels - 1` times in `properties`/`v`.
+
+    The wrappers carry no `"type": "object"`: the leaf is what the examples are checked
+    against, so a depth refusal cannot hide behind "does not match return_schema".
+    """
+    schema = {"type": "integer"}
+    for _ in range(levels - 1):
+        schema = {"properties": {"v": schema}}
+    return schema
+
+
+def test_import_refuses_a_non_object_return_schema(tmp_path, capsys):
+    """`jsonschema` iterates the schema, so an int or a null is a `TypeError` out of `main`."""
+    reg, _ = build(tmp_path / "one")
+    for value, tag in ((5, "int"), (None, "null")):
+        path = repack(tmp_path, reg, with_return_schema(value), f"return-{tag}.jit.json")
+        refusal(capsys, tmp_path / f"fresh-{tag}", path, expect=("schema", "object"))
+
+
+def test_import_refuses_a_non_object_param_schema_without_storing(tmp_path, capsys):
+    """Old code imported rc 0, wrote a whole `fn_…` tree, and every later `call` tracebacked."""
+    reg, _ = build(tmp_path / "one")
+    for value, tag in ((5, "int"), (None, "null")):
+        path = repack(tmp_path, reg, with_param_schema(value), f"param-{tag}.jit.json")
+        home = tmp_path / f"fresh-{tag}"
+        refusal(capsys, home, path, expect=("schema", "object"))
+        assert stored(home) == [], "a refused bundle must leave no directory at all"
+
+
+def test_import_refuses_a_schema_nested_too_deeply(tmp_path, capsys):
+    """The boundary is 64 nested schema objects: 64 levels import, 65 levels are refused.
+
+    `jsonschema.validate` (and `json.dumps` in the store) recurse through the schema, so
+    a file could turn its own nesting into a `RecursionError` after verification had
+    already run. The refusal happens while the bundle is being read, for both fields.
+    """
+    reg, _ = build(tmp_path / "one")
+    for field, edit in (("return_schema", with_return_schema),
+                        ("param_schema", with_param_schema)):
+        accepted = repack(tmp_path, reg, edit(nested_schema(64)), f"deep64-{field}.jit.json")
+        expected = json.loads(accepted.read_text())["function"]["spec_hash"]
+        home = tmp_path / f"fresh64-{field}"
+        assert run(home, "import", str(accepted)) == 0
+        capsys.readouterr()
+        assert stored(home) == [expected]
+        assert run(home, "call", "rank", json.dumps({"values": [1, 2]})) == 0
+        assert capsys.readouterr().out.splitlines()[-1] == "2"
+
+        too_deep = repack(tmp_path, reg, edit(nested_schema(65)), f"deep65-{field}.jit.json")
+        refusal(capsys, tmp_path / f"fresh65-{field}", too_deep,
+                expect=("nest", "deep", "depth", "64", "limit"))
+
+
+def test_import_refuses_a_boolean_schema(tmp_path, capsys):
+    """`true`/`false` are schemas to `jsonschema`, but a bundle may carry objects only."""
+    reg, _ = build(tmp_path / "one")
+    for field, edit, value in (("return_schema", with_return_schema, True),
+                               ("param_schema", with_param_schema, False)):
+        path = repack(tmp_path, reg, edit(value), f"boolean-{field}.jit.json")
+        refusal(capsys, tmp_path / f"fresh-{field}", path, expect=(field,))
+
+
+def test_import_refuses_a_ref_in_draft07_dependencies(tmp_path, capsys):
+    """draft-07 keeps schemas under `dependencies`; a walk that only knows 2020-12 misses it."""
+    reg, _ = build(tmp_path / "one")
+    with counting_http() as (url, hits):
+        schema = {"$schema": "http://json-schema.org/draft-07/schema#",
+                  "type": "object",
+                  "properties": {"values": {"type": "array"}},
+                  "dependencies": {"values": {"$ref": url}}}
+        path = repack(tmp_path, reg, with_param_schema(schema), "deps-ref.jit.json")
+        refusal(capsys, tmp_path / "fresh", path, expect=("$ref", "reference"))
+    assert hits == [], f"the importer fetched {hits}"
+
+
+def test_a_draft07_dependencies_list_still_imports(tmp_path, capsys):
+    """`dependencies: {"values": ["other"]}` is a property requirement, not a schema."""
+    reg, _ = build(tmp_path / "one")
+    schema = {"$schema": "http://json-schema.org/draft-07/schema#",
+              "type": "object",
+              "properties": {"values": {"type": "array"}},
+              "dependencies": {"values": ["other"]}}
+    path = repack(tmp_path, reg, with_param_schema(schema), "deps-list.jit.json")
+    expected = json.loads(path.read_text())["function"]["spec_hash"]
+    fresh = tmp_path / "fresh"
+    assert run(fresh, "import", str(path)) == 0
+    capsys.readouterr()
+    assert stored(fresh) == [expected]
+    assert run(fresh, "call", "rank", json.dumps({"values": [1, 2], "other": 1})) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "2"
+
+
+def _guard_message(check, value, schema):
+    """One of the three schema guards has to answer, in one line, instead of raising.
+
+    Neither shape below can come through `import` (the parse gate refuses both), so this
+    is the layer that protects a registry edited by hand: `5` is a `TypeError` and a
+    chain past the interpreter's stack is a `RecursionError`; both must become the same
+    one-line answer.
+    """
+    start = time.monotonic()
+    message = check(value, schema)
+    elapsed = time.monotonic() - start
+    assert isinstance(message, str), (check.__name__, message)
+    assert message == "the schema is not something this machine can apply", (
+        check.__name__, message)
+    assert "\n" not in message, message
+    assert elapsed < 2, f"{check.__name__} took {elapsed:.1f}s"
+
+
+def test_verify_schema_check_refuses_a_non_object_schema():
+    """`verify._schema_ok`, one of the three `except` lines: it must answer, not raise.
+
+    The deep chain is 500 schema objects, not 65: on CPython 3.12 the recursion error
+    starts around 100 levels (a 65-deep schema validates fine and returns ""), so 65
+    would not exercise the `RecursionError` branch at all.
+    """
+    for schema in (5, nested_schema(500)):
+        _guard_message(_schema_ok, 3, schema)
+
+
+def test_runtime_schema_check_refuses_a_non_object_schema(tmp_path, capsys):
+    """`runtime._schema_error` — the args guard — plus the same state through `call`."""
+    for schema in (5, nested_schema(500)):
+        _guard_message(_schema_error, 3, schema)
+
+    # A hand-edited registry is how a non-object schema reaches `call` once import refuses it.
+    reg, fn = build(tmp_path / "one")
+    spec_path = Path(reg.root) / fn.spec_hash / "spec.json"
+    meta = json.loads(spec_path.read_text())
+    meta["spec"]["param_schema"] = 5
+    spec_path.write_text(json.dumps(meta))
+    capsys.readouterr()
+    raised, rc = "", None
+    try:
+        rc = run(reg.root, "call", "rank", json.dumps({"values": [1, 2]}))
+    except Exception as exc:          # 93aea3c: the TypeError escapes `call`
+        raised = f"{type(exc).__name__}: {exc}"
+    out, err = capsys.readouterr()
+    assert not raised, raised
+    assert rc == 1, (rc, out, err)
+    assert "Traceback" not in out + err, (out, err)
+    assert out.count("\n") == 1 and "guard_failed" in out, out
+
+
+def test_lookup_fits_refuses_a_non_object_schema():
+    """`lookup._fits`, the third `except` line: a rejected candidate has a one-line reason.
+
+    Same two shapes as the other guards: `5` (`TypeError`) and a 500-deep chain
+    (`RecursionError`) both have to become the one-line "not something this machine can
+    apply" answer rather than escape into the look-up path.
+    """
+    for schema in (5, nested_schema(500)):
+        _guard_message(lookup._fits, 3, schema)
+
+
 # --- text this machine cannot store -----------------------------------------
 # A lone surrogate (`"\ud800"`) is legal JSON and not encodable as UTF-8. It used to die
 # inside `spec_hash` (requirement) or halfway through `adopt()` (created_at, a case's
@@ -840,7 +1005,7 @@ def test_import_refuses_a_lone_surrogate_in_the_requirement(tmp_path, capsys):
     data = json.loads(path.read_text())
     data["function"]["requirement"] = "Count \ud800 {values}."
     path.write_text(json.dumps(data))      # ensure_ascii: the lone surrogate stays JSON
-    refusal(capsys, tmp_path / "fresh", path, expect=("surrogate", "cannot store"))
+    refusal(capsys, tmp_path / "fresh", path, expect=("lone surrogate",))
 
 
 def test_import_refuses_a_lone_surrogate_in_created_at(tmp_path, capsys):
@@ -849,7 +1014,7 @@ def test_import_refuses_a_lone_surrogate_in_created_at(tmp_path, capsys):
     data = json.loads(path.read_text())
     data["function"]["created_at"] = "2026-11-03T00:00:00\ud800"
     path.write_text(json.dumps(data))
-    refusal(capsys, tmp_path / "fresh", path, expect=("surrogate", "cannot store"))
+    refusal(capsys, tmp_path / "fresh", path, expect=("lone surrogate",))
 
 
 def test_import_refuses_a_lone_surrogate_in_a_case_field(tmp_path, capsys):
@@ -860,7 +1025,7 @@ def test_import_refuses_a_lone_surrogate_in_a_case_field(tmp_path, capsys):
         data["tests"]["examples"][0][key] = "rests on \ud800"
         bad = tmp_path / f"case-{key}.jit.json"
         bad.write_text(json.dumps(data))
-        refusal(capsys, tmp_path / f"fresh-{key}", bad, expect=("surrogate", "cannot store"))
+        refusal(capsys, tmp_path / f"fresh-{key}", bad, expect=("lone surrogate",))
 
 
 # --- the store is UTF-8 whatever the process locale is -----------------------

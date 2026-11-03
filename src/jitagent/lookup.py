@@ -98,6 +98,10 @@ def _fits(value: Any, schema: dict) -> str:
     except (Unresolvable, Unretrievable):
         # jsonschema raises `_WrappedReferencingError`, a subclass of Unresolvable.
         return "the schema points at another file or URL, which this machine does not follow"
+    except (TypeError, RecursionError):
+        # A hand-edited `spec.json` can still hand us a non-schema or one nested past
+        # the interpreter's stack; the caller gets one line, never a traceback.
+        return "the schema is not something this machine can apply"
 
 
 def schema_compatible(spec: Spec, examples: list[Example]) -> str:

@@ -88,42 +88,71 @@ def _kind(value: Any) -> str:
 # input has a field called `$ref` legitimately produces `properties: {"$ref": {...}}`
 # (there the `$ref` is a property name, not a keyword). A recursive "any dict with a
 # `$ref` key" check would refuse a real bundle; only these keywords are entered.
-_SCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+# `dependencies` (draft-07) is a map whose values may be a schema or a list of property
+# names: the dict values are walked, the list values are skipped (a list is names, not a
+# schema). This closes nothing on its own — with no `$schema` declared, `jsonschema`
+# applies its latest dialect, which ignores `dependencies` — it is belt and braces so the
+# walk does not call a list of names a schema.
+_SCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+                "dependencies")
 _SCHEMA_ONE = ("items", "additionalItems", "additionalProperties", "not", "if", "then",
                "else", "contains", "propertyNames", "unevaluatedItems",
                "unevaluatedProperties")
 _SCHEMA_MANY = ("allOf", "anyOf", "oneOf", "prefixItems")
+
+# `jsonschema` recurses through the schema it applies (`registry._dump` and `json` do
+# too), so a file can turn its nesting into a `RecursionError` after verification has
+# already run. 64 is far beyond anything the inferencer produces and well inside the
+# interpreter's stack; deeper is refused while the bundle is being read.
+_MAX_SCHEMA_DEPTH = 64
 
 
 def _ref_path(schema: Any, where: str) -> tuple[str, str] | None:
     """The path of the first schema object that holds a `$ref`-family keyword, and which
     keyword, or None when the schema stands on its own.
 
-    Iterative, and only the positions above are entered: the nesting is the file author's,
-    so recursion here would put a `RecursionError` back in the middle of the one-line
-    promise. Nothing is resolved, fetched or imported — the pointer is only located.
+    This is the bundle's whole schema gate: it refuses a node that is not a JSON Schema
+    object, refuses nesting past `_MAX_SCHEMA_DEPTH`, and refuses a pointer out of the
+    document. Iterative, and only the schema positions above are entered: the nesting is
+    the file author's, so recursion here would put a `RecursionError` back in the middle
+    of the one-line promise. Nothing is resolved, fetched or imported — only located.
     """
-    stack = [(schema, where)]
+    root = where
+    stack = [(schema, where, 1)]
     while stack:
-        node, at = stack.pop()
+        node, at, depth = stack.pop()
+        # Objects only. A boolean schema is legal JSON Schema, but a bundle may not carry
+        # one: the store, the hashes and everything downstream assume an object, and two
+        # kinds of schema in one format is a second rule to get wrong. `infer` only ever
+        # emits objects, so no generated bundle is refused.
         if not isinstance(node, dict):
-            continue
+            raise BadBundle(
+                f'"{root}" must be a JSON Schema object, not {_kind(node)} — nothing was '
+                "imported")
+        if depth > _MAX_SCHEMA_DEPTH:
+            raise BadBundle(
+                f'"{root}" nests deeper than {_MAX_SCHEMA_DEPTH} levels, which this '
+                "importer will not walk — nothing was imported")
         for key in node:
             if key in _REF_KEYS:
                 return at, key
         for key, child in node.items():
             if key in _SCHEMA_MAPS and isinstance(child, dict):
                 for name, sub in child.items():
-                    stack.append((sub, f"{at}.{key}.{name}"))
+                    if key == "dependencies" and not isinstance(sub, dict):
+                        # draft-07 allows a list of property names here; a list is not a
+                        # schema, so it is not a node of this walk.
+                        continue
+                    stack.append((sub, f"{at}.{key}.{name}", depth + 1))
             elif key in _SCHEMA_ONE:
                 if isinstance(child, dict):
-                    stack.append((child, f"{at}.{key}"))
+                    stack.append((child, f"{at}.{key}", depth + 1))
                 elif isinstance(child, list):     # draft-04 tuple form of `items`
                     for i, sub in enumerate(child):
-                        stack.append((sub, f"{at}.{key}[{i}]"))
+                        stack.append((sub, f"{at}.{key}[{i}]", depth + 1))
             elif key in _SCHEMA_MANY and isinstance(child, list):
                 for i, sub in enumerate(child):
-                    stack.append((sub, f"{at}.{key}[{i}]"))
+                    stack.append((sub, f"{at}.{key}[{i}]", depth + 1))
     return None
 
 

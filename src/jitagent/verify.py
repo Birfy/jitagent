@@ -63,6 +63,10 @@ def _schema_ok(value: Any, schema: dict) -> str:
         # jsonschema wraps these (`_WrappedReferencingError` is a subclass of
         # Unresolvable, which is why that one class covers a URL and a local pointer).
         return "the schema points at another file or URL, which this machine does not follow"
+    except (TypeError, RecursionError):
+        # A hand-edited `spec.json` can still hand us a non-schema or one nested past
+        # the interpreter's stack; the caller gets one line, never a traceback.
+        return "the schema is not something this machine can apply"
 
 
 def _failures(run: RunResult, examples: list[Example]) -> list[dict]:
