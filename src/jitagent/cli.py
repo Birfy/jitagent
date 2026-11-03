@@ -245,15 +245,21 @@ def cmd_export(args) -> int:
 
     fn = Registry(args.home).get(args.handle)
     if fn is None:
-        print(f"no such function: {args.handle}", file=sys.stderr)
+        print(f"no such function: {args.handle!r}", file=sys.stderr)
         return 1
     text = bundle.dumps(fn)
     if not args.out:
         sys.stdout.write(text)
         return 0
     replaced = Path(args.out).exists()
+    # The bundle is UTF-8 by definition (`dumps` uses ensure_ascii=False, `parse` reads
+    # utf-8), so the write must name the codec: the platform default would fail the
+    # round trip on a non-UTF-8 locale, or fail the write outright.
     try:
-        Path(args.out).write_text(text)
+        Path(args.out).write_text(text, encoding="utf-8")
+    except UnicodeEncodeError as e:
+        print(f"cannot write {args.out!r}: not UTF-8 text ({e})", file=sys.stderr)
+        return 1
     except OSError as e:
         print(f"cannot write {args.out!r}: {e.strerror or e}", file=sys.stderr)
         return 1

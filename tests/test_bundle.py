@@ -76,6 +76,13 @@ def test_export_then_import_reproduces_the_call(tmp_path, capsys):
 
 
 def test_export_is_deterministic(tmp_path):
+    """Two exports of one *unchanged* function are byte-identical.
+
+    This holds while nothing in the registry moves: `created_at` and the stored report are
+    part of the bundle, so re-compiling or re-saving legitimately produces a different
+    file. What is pinned here is the serialization (sorted keys, stable version order),
+    not determinism across recompiles.
+    """
     reg, _ = build(tmp_path / "one")
     first = exported(tmp_path, reg)
     second = tmp_path / "again.jit.json"
@@ -89,6 +96,84 @@ def test_export_is_deterministic(tmp_path):
     text = first.read_text()
     order = [text.index(k) for k in ('"format"', '"function"', '"tests"', '"versions"')]
     assert order == sorted(order), "keys must be sorted, so the diff of two bundles is the change"
+
+
+def test_export_of_a_missing_function_escapes_the_name(tmp_path, capsys):
+    """A handle is user input: an ESC byte in it must not reach the terminal raw."""
+    assert run(tmp_path, "export", "nope\x1b[31m") == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "\x1b" not in err and "no such function: 'nope" in err
+
+
+# --- the file is UTF-8, whatever the machine's locale is ---------------------
+NON_ASCII_REQ = "数える：{values} の中の数を数える。"
+NON_ASCII_EXAMPLES = [Example({"values": ["一", "二", "三"]}, 3),
+                      Example({"values": []}, 0, boundary=True)]
+
+
+def test_a_non_ascii_bundle_round_trips_through_utf8(tmp_path, capsys):
+    """A bundle holding non-ASCII text must be written as UTF-8 and read back unchanged.
+
+    `dumps(..., ensure_ascii=False)` and `parse`'s utf-8 read make the file UTF-8 by
+    definition, so `export` has to name that codec instead of taking the platform default
+    (on a cp1252 Windows locale the default writes bytes this importer cannot decode).
+    The assertion is on the bytes, so it does not depend on the ambient locale. On a
+    UTF-8-mode machine (like CI) it also passes with the platform default, though; the
+    companion test below is the one that pins the codec `export` passes.
+    """
+    reg, _ = build(tmp_path / "one", requirement=NON_ASCII_REQ,
+                   examples=NON_ASCII_EXAMPLES, name="count")
+    path = tmp_path / "count.jit.json"
+    assert run(reg.root, "export", "count", "-o", str(path)) == 0
+    capsys.readouterr()
+
+    raw = path.read_bytes()
+    raw.decode("utf-8")  # exactly what `import` does; a locale-codec write would fail here
+    assert NON_ASCII_REQ.encode("utf-8") in raw, \
+        "ensure_ascii=False text must land as UTF-8 bytes, not \\u escapes"
+    assert "\\u6570" not in raw.decode("utf-8")
+
+    fresh = tmp_path / "two"
+    copy = tmp_path / "again.jit.json"
+    copy.write_bytes(raw)  # the file itself is the thing being moved
+    assert run(fresh, "import", str(copy)) == 0
+    capsys.readouterr()
+
+    args = json.dumps({"values": ["四", "五"]}, ensure_ascii=False)
+    assert run(reg.root, "call", "count", args) == 0
+    before = capsys.readouterr().out
+    assert run(fresh, "call", "count", args) == 0
+    after = capsys.readouterr().out
+    assert before == after and "2" in before
+    assert run(fresh, "inspect", "count") == 0
+    assert NON_ASCII_REQ in capsys.readouterr().out, "the requirement must survive as text"
+
+
+def test_export_names_the_codec_instead_of_taking_the_platform_default(tmp_path, capsys,
+                                                                      monkeypatch):
+    """Simulate a Windows cp1252 default: the codec `export` passes must decide.
+
+    `Path.write_text(data)` with no `encoding=` means "the platform's codec". Under UTF-8
+    mode (this CI) that happens to be utf-8, so the file is only actually broken on a
+    machine we cannot run here. This replaces that default instead: any call that does not
+    name a codec writes cp1252, and a bundle with non-ASCII text then raises
+    `UnicodeEncodeError` — which `cmd_export` used to let escape, because it caught
+    `OSError` only.
+    """
+    real_write_text = Path.write_text
+
+    def default_is_cp1252(self, data, encoding=None, errors=None, newline=None):
+        return real_write_text(self, data, encoding or "cp1252", errors, newline)
+
+    reg, _ = build(tmp_path / "one", requirement=NON_ASCII_REQ,
+                   examples=NON_ASCII_EXAMPLES, name="count")
+    monkeypatch.setattr(Path, "write_text", default_is_cp1252)
+
+    path = tmp_path / "count.jit.json"
+    assert run(reg.root, "export", "count", "-o", str(path)) == 0
+    capsys.readouterr()
+    raw = path.read_bytes()
+    assert NON_ASCII_REQ.encode("utf-8") in raw, "a cp1252 default must not reach the file"
 
 
 # --- import re-verifies rather than trusts ----------------------------------

@@ -25,6 +25,10 @@ is 0, the API may change in a minor release.
 - Refusals — unknown format version, malformed JSON, a `spec_hash` that disagrees with
   the bundle's own contents, a bundle with no versions — are one line on stderr and
   exit 1, not a traceback.
+- The bundle file is UTF-8 on disk: `export` names that codec instead of taking the
+  platform default, so a requirement, name or case value with non-ASCII text is written
+  as UTF-8 bytes and the same file imports back unchanged on any locale, including
+  Windows.
 
 ## [0.0.1] — 2026-09-16
 
