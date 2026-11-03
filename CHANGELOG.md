@@ -29,6 +29,12 @@ is 0, the API may change in a minor release.
   platform default, so a requirement, name or case value with non-ASCII text is written
   as UTF-8 bytes and the same file imports back unchanged on any locale, including
   Windows.
+- An imported file cannot pick the limits it runs under: `import` verifies with this
+  machine's timeout and memory ceiling whatever the bundle's `spec` says (and refuses a
+  spec outside sane bounds), caps a bundle at 100 versions and 120 seconds of
+  verification, requires a printable name without `@` that a command can look up again,
+  and bounds version names so no entry can overflow a path or an `int`. Pathological
+  files — deeply nested JSON, absurd versions — are one line and exit 1, not a traceback.
 
 ## [0.0.1] — 2026-09-16
 

@@ -14,13 +14,17 @@ the diff of two bundles is a diff of the case set.
 **Import re-verifies, it does not trust.** A bundle is a file someone can edit, so what
 it says about itself is worth nothing on the machine importing it. Every version is run
 against the bundle's own cases in the local sandbox before anything is written, and one
-failure refuses the whole file. That is what makes a bundle safe to commit and review:
-the reviewer can read the cases, and the importer re-checked them anyway.
+failure refuses the whole file. That is what makes a bundle reviewable: the reviewer can
+read the cases, and the importer re-checked them anyway. It is not proof of intent. The
+sandbox contains bugs, not attackers (see `sandbox.py`), so a bundle is code you chose to
+run on this machine — not code you can trust because it verified.
 """
 from __future__ import annotations
 
 import json
 import re
+import time
+from dataclasses import replace
 from typing import Any
 
 from .registry import Function, TestSet, Version, spec_hash
@@ -33,7 +37,15 @@ from .verify import verify
 FORMAT = "jitagent.bundle/1"
 SUPPORTED = (FORMAT,)
 
-_VERSION_RE = re.compile(r"^v([1-9][0-9]*)$")
+# Nine digits, not "any number": `Version.n` turns the name into an `int`, and Python
+# refuses to convert more than 4300 digits — a bundle must not be able to raise that.
+_VERSION_RE = re.compile(r"^v([1-9][0-9]{0,8})$")
+_MAX_VERSIONS = 100
+_MAX_NAME = 64
+# Verification is done here, with this machine's limits, whatever the bundle asks for; a
+# whole file may not spend more than this many seconds in the importer.
+_LOCAL_LIMITS = {"timeout_ms": 5000, "mem_mb": 512}
+_MAX_VERIFY_SECONDS = 120
 _LEVELS = {level.value for level in Level}
 
 
@@ -96,7 +108,9 @@ def dumps(fn: Function) -> str:
 def parse(text: str) -> Function:
     try:
         data = json.loads(text)
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
+        # `RecursionError` is what a file of 100 000 "[" raises: pathological, but it is
+        # still a file a person can be handed, and "one line, not a traceback" is the deal.
         raise BadBundle(f"not JSON: {e}") from None
     return from_dict(data)
 
@@ -126,6 +140,15 @@ def from_dict(data: Any) -> Function:
         raise BadBundle(f'"function.spec" is not a spec: {e}') from None
     if not isinstance(spec.entry, str) or not spec.entry.isidentifier():
         raise BadBundle('"function.spec.entry" must be a Python identifier')
+    # The spec names the resource limits the *verifier* will hand to the sandbox. A bundle
+    # is untrusted, so an unbounded `timeout_ms` (or a huge `mem_mb`, which disarms both
+    # RLIMIT_AS and the watchdog) would let one file stall the importer indefinitely.
+    for key, low, high in (("timeout_ms", 1, 60_000), ("mem_mb", 16, 4096)):
+        value = getattr(spec, key)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise BadBundle(
+                f'"function.spec.{key}" must be an integer between {low} and {high}, '
+                f"not {value!r} — a bundle may not pick its own resource limits")
 
     # The hash is what the registry would key this function by, so it has to be computed
     # here rather than believed: a bundle whose hash disagrees with its own contents is
@@ -141,6 +164,14 @@ def from_dict(data: Any) -> Function:
     name = meta.get("name", "")
     if not isinstance(name, str):
         raise BadBundle('"function.name" must be a string')
+    if name and (len(name) > _MAX_NAME or not name.isprintable() or "@" in name
+                 or name != name.strip()):
+        # Printed by `list`, the success line and any terminal; a name has to be one a
+        # command can take back (`get <name>`, where '@' starts a version).
+        raise BadBundle(
+            f"the bundle's name {name[:32]!r} cannot be used: a name has to be printable, "
+            f"at most {_MAX_NAME} characters, without '@' or leading/trailing spaces "
+            "— nothing was imported")
     created_at = meta.get("created_at", "")
     if not isinstance(created_at, str):
         raise BadBundle('"function.created_at" must be a string')
@@ -176,13 +207,18 @@ def _examples(tests: Any) -> list[Example]:
 def _versions(rows: Any) -> list[Version]:
     if not isinstance(rows, list) or not rows:
         raise BadBundle('"versions" must be a non-empty list — there is nothing to import')
+    if len(rows) > _MAX_VERSIONS:
+        raise BadBundle(
+            f'"versions" holds {len(rows)} entries; this importer verifies each one here '
+            f"and will not take more than {_MAX_VERSIONS} in one file — nothing was imported")
     versions, seen = [], set()
     for i, row in enumerate(rows):
         if not isinstance(row, dict):
             raise BadBundle(f"version {i} is not an object")
         name = row.get("name")
         if not isinstance(name, str) or not _VERSION_RE.match(name):
-            raise BadBundle(f'version {i} needs a name like "v1", not {name!r}')
+            raise BadBundle(f'version {i} needs a name like "v1" (at most 9 digits), '
+                            f"not {name!r}")
         if name in seen:
             raise BadBundle(f"version {name} appears twice")
         seen.add(name)
@@ -233,13 +269,24 @@ def reverify(fn: Function, sandbox: Sandbox | None = None) -> list[Report]:
     version and the gate that refused it.
     """
     sb = sandbox or Sandbox()
+    # The bundle's own limits are validated, but they are still the author's numbers: use
+    # this machine's limits for the run, and a wall-clock budget for the whole file.
+    local = replace(fn.spec,
+                    timeout_ms=min(fn.spec.timeout_ms, _LOCAL_LIMITS["timeout_ms"]),
+                    mem_mb=min(fn.spec.mem_mb, _LOCAL_LIMITS["mem_mb"]))
+    deadline = time.monotonic() + _MAX_VERIFY_SECONDS
     reports = []
     for v in fn.versions:
+        if time.monotonic() > deadline:
+            raise BadBundle(
+                f"verifying this bundle took longer than {_MAX_VERIFY_SECONDS} s, so it was "
+                "stopped — the file asks for more work than an import should do here; "
+                "nothing was imported")
         if v.level is not Level.VERIFIED:
             raise BadBundle(
                 f"version {v.name} is {v.level.value}; only VERIFIED versions can travel "
                 "— nothing was imported")
-        report = verify(v.code, fn.spec, fn.tests.examples, sandbox=sb)
+        report = verify(v.code, local, fn.tests.examples, sandbox=sb)
         reports.append(report)
         if report.level is not Level.VERIFIED:
             raise BadBundle(f"version {v.name} does not hold up here ({_why(report)}) — "
@@ -253,7 +300,9 @@ def _why(report: Report) -> str:
     gate = next((g for g in report.gates if not g.passed and g.blocking), None)
     if gate is None:
         return report.level.value
-    line = f"{gate.name}: {gate.summary}"
+    # `gate.summary` can carry text from the bundle's own code (an exception message), and
+    # a terminal must not receive an ESC byte from a file. JSON-quote it, like `_short`.
+    line = f"{gate.name}: {_short(gate.summary, 160)}"
     failures = (gate.detail or {}).get("failures") if gate.detail else None
     if failures:
         first = failures[0]

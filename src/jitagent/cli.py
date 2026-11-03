@@ -293,6 +293,12 @@ def cmd_import(args) -> int:
     except (bundle.BadBundle, NameTaken, BundleConflict) as e:
         print(e, file=sys.stderr)
         return 1
+    except OSError as e:
+        # Belt and braces: everything a malicious value could make unwritable is refused
+        # at parse time, but a full disk or a hostile pre-existing file must still be one
+        # line rather than a traceback.
+        print(f"cannot store the imported function: {e.strerror or e}", file=sys.stderr)
+        return 1
     print(f"imported {target.ref} ({target.handle}): {new_versions} new version(s), "
           f"{new_cases} new case(s) — now {len(target.versions)} version(s), "
           f"{len(target.tests.examples)} case(s)")
@@ -351,8 +357,9 @@ def main(argv=None) -> int:
                     help="write the bundle here (default: stdout)")
     ex.set_defaults(fn=cmd_export)
 
-    im = sub.add_parser("import", help="load a bundle, re-verifying every version first")
-    im.add_argument("bundle", help="the file `jitagent export` wrote")
+    im = sub.add_parser("import", help="verify every version of a bundle here, then store it")
+    im.add_argument("bundle", help="the file `jitagent export` wrote; its code is run "
+                                   "here in the verification sandbox")
     im.set_defaults(fn=cmd_import)
 
     cl = sub.add_parser("call", help="run a compiled function in the sandbox")

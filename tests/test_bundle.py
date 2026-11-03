@@ -6,6 +6,7 @@ registry, exported, and imported into a second, empty one. The import side is th
 worth testing: it runs foreign code, so it re-verifies instead of trusting the file.
 """
 import json
+import time
 from pathlib import Path
 
 from jitagent import Example, Registry, Sandbox
@@ -309,3 +310,117 @@ def test_import_merges_only_the_versions_and_cases_it_lacks(tmp_path, capsys):
     cases = json.loads((Path(fresh) / fn.spec_hash / "tests.json").read_text())["examples"]
     merged = [c for c in cases if c["origin"] == "generated"]
     assert merged and merged[0]["assumes"], "provenance must survive the trip"
+
+
+# --- a bundle is a file someone may have written to hurt this machine ---------
+def test_import_refuses_a_bundle_that_picks_its_own_limits(tmp_path, capsys):
+    """The spec's limits are the verifier's, not the file's.
+
+    `timeout_ms`/`mem_mb` are not part of `spec_hash`, so a file can set them freely;
+    an unbounded timeout stalls the importer, and a huge `mem_mb` disarms the sandbox's
+    address-space limit and watchdog.
+    """
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    good = json.loads(path.read_text())
+    fresh = tmp_path / "two"
+    for key, value in (("timeout_ms", 10 ** 9), ("timeout_ms", 0), ("timeout_ms", "6000"),
+                       ("mem_mb", 10 ** 6), ("mem_mb", True)):
+        data = json.loads(json.dumps(good))
+        data["function"]["spec"][key] = value
+        path.write_text(json.dumps(data))
+        assert run(fresh, "import", str(path)) == 1, (key, value)
+        err = capsys.readouterr().err
+        assert key in err and "Traceback" not in err and err.count("\n") == 1, (key, value, err)
+    assert stored(fresh) == [], "a refused bundle must not be written"
+
+
+def test_import_caps_the_run_a_bundle_asks_for(tmp_path, capsys):
+    """A 60 s timeout around an endless loop: the importer still uses its own 5 s limit."""
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    data["function"]["spec"]["timeout_ms"] = 60000
+    data["versions"][0]["code"] = "def solve(params, ctx):\n    while True:\n        pass\n"
+    path.write_text(json.dumps(data))
+
+    start = time.monotonic()
+    assert run(tmp_path / "two", "import", str(path)) == 1
+    elapsed = time.monotonic() - start
+    err = capsys.readouterr().err
+    assert elapsed < 30, f"the bundle's 60 s timeout was honoured ({elapsed:.1f}s)"
+    assert "Traceback" not in err and err.count("\n") == 1, err
+
+
+def test_import_refuses_a_name_no_command_can_address(tmp_path, capsys):
+    """The name is echoed by `list` and the success line, so it must be typeable and plain."""
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    good = json.loads(path.read_text())
+    fresh = tmp_path / "two"
+    for bad in ("a@b", "rank\x1b[31m", " rank", "rank ", "a\nb", "x" * 65):
+        data = json.loads(json.dumps(good))
+        data["function"]["name"] = bad
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert run(fresh, "import", str(path)) == 1, repr(bad)
+        err = capsys.readouterr().err
+        assert "\x1b" not in err, "a bundle must not put an ESC byte on the terminal"
+        assert "Traceback" not in err and err.count("\n") == 1, (repr(bad), err)
+    assert stored(fresh) == []
+
+
+def test_import_refuses_a_version_name_it_cannot_store(tmp_path, capsys):
+    """`save_version` turns the name into a directory and into an `int`: bound it at parse."""
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    good = json.loads(path.read_text())
+    fresh = tmp_path / "two"
+    for bad in ("v" + "9" * 400, "v" + "9" * 5000, "v0", "1.0"):
+        data = json.loads(json.dumps(good))
+        data["versions"][0]["name"] = bad
+        path.write_text(json.dumps(data))
+        assert run(fresh, "import", str(path)) == 1, bad[:20]
+        err = capsys.readouterr().err
+        assert "Traceback" not in err and err.count("\n") == 1, (bad[:20], err)
+    assert stored(fresh) == []
+
+
+def test_import_refuses_more_versions_than_it_will_verify(tmp_path, capsys):
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    one = data["versions"][0]
+    data["versions"] = [dict(one, name=f"v{i}") for i in range(1, 102)]
+    path.write_text(json.dumps(data))
+
+    fresh = tmp_path / "two"
+    assert run(fresh, "import", str(path)) == 1
+    err = capsys.readouterr().err
+    assert "101" in err and "Traceback" not in err and err.count("\n") == 1
+    assert stored(fresh) == []
+
+
+def test_import_refuses_a_file_too_deep_to_parse(tmp_path, capsys):
+    """100k "[" is a `RecursionError` from json.loads, not a `ValueError`."""
+    fresh = tmp_path / "two"
+    path = tmp_path / "deep.jit.json"
+    path.write_text("[" * 100_000)
+    assert run(fresh, "import", str(path)) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and err.count("\n") == 1, err
+    assert stored(fresh) == []
+
+
+def test_a_refusal_does_not_echo_control_bytes_from_the_bundle(tmp_path, capsys):
+    """The refusal line names the failing gate; that text can come from the bundle's code."""
+    reg, _ = build(tmp_path / "one")
+    path = exported(tmp_path, reg)
+    data = json.loads(path.read_text())
+    data["versions"][0]["code"] = ('raise ValueError("\\x1b[31mFAKE ERROR\\x1b[0m")\n'
+                                   'def solve(params, ctx):\n    return 1\n')
+    path.write_text(json.dumps(data))
+
+    assert run(tmp_path / "two", "import", str(path)) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "\x1b" not in err, "a bundle must not write an ESC byte to the terminal"
