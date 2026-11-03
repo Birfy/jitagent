@@ -168,7 +168,10 @@ def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
     try:
-        with os.fdopen(fd, "w") as fh:
+        # The stored text is UTF-8 whatever the process locale is: under `LC_ALL=C` the
+        # default is ASCII, and a valid CJK bundle died here *after* its directory was
+        # made. A bundle can be imported on a machine whose locale is not ours.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, path)
     except BaseException:
@@ -186,6 +189,10 @@ class NotCacheable(ValueError):
 
 class NameTaken(ValueError):
     pass
+
+
+class BundleConflict(ValueError):
+    """An imported bundle disagrees with what is already on the shelf."""
 
 
 class Registry:
@@ -222,7 +229,7 @@ class Registry:
         if not name:
             return None
         for d in self._dirs():
-            meta = json.loads((d / "spec.json").read_text())
+            meta = json.loads((d / "spec.json").read_text(encoding="utf-8"))
             if meta.get("name") == name:
                 return self._load(d)
         return None
@@ -237,20 +244,21 @@ class Registry:
         return (d for d in sorted(self.root.iterdir()) if (d / "spec.json").exists())
 
     def _load(self, d: Path) -> Function:
-        meta = json.loads((d / "spec.json").read_text())
-        tests = TestSet.from_dict(json.loads((d / "tests.json").read_text())
+        meta = json.loads((d / "spec.json").read_text(encoding="utf-8"))
+        tests = TestSet.from_dict(json.loads((d / "tests.json").read_text(encoding="utf-8"))
                                   if (d / "tests.json").exists() else {})
         versions = []
         for vd in sorted(d.glob("v*"), key=lambda p: int(p.name[1:]) if p.name[1:].isdigit() else 0):
             if not (vd / "meta.json").exists():
                 continue
-            vm = json.loads((vd / "meta.json").read_text())
+            vm = json.loads((vd / "meta.json").read_text(encoding="utf-8"))
             report = None
             if (vd / "report.json").exists():
-                report = Report.from_dict(json.loads((vd / "report.json").read_text()))
+                report = Report.from_dict(
+                    json.loads((vd / "report.json").read_text(encoding="utf-8")))
             versions.append(Version(
                 name=vm["name"], level=Level(vm["level"]),
-                code=(vd / "code.py").read_text(), report=report,
+                code=(vd / "code.py").read_text(encoding="utf-8"), report=report,
                 created_at=vm.get("created_at", ""), model=vm.get("model", ""),
                 attempts=vm.get("attempts", 1),
                 input_tokens=vm.get("input_tokens", 0),
@@ -324,3 +332,74 @@ class Registry:
         if v.report is not None:
             _dump(vd / "report.json", v.report.to_dict())
         _dump(vd / "meta.json", v.meta())
+
+    def existing_for(self, spec_hash_value: str) -> Function | None:
+        d = self.dir_of(spec_hash_value)
+        return self._load(d) if (d / "spec.json").exists() else None
+
+    def adoptable(self, fn: Function, existing: Function | None = None) -> None:
+        """Raise if `adopt()` would refuse. Split out so an importer can answer that
+        **before** running the bundle's code in the sandbox: a file that cannot be
+        stored has no business executing here."""
+        existing = existing if existing is not None else self.existing_for(fn.spec_hash)
+        if existing is None:
+            if fn.name and (other := self.by_name(fn.name)) is not None:
+                raise NameTaken(
+                    f"the name {fn.name!r} is already taken by {other.handle} "
+                    f"({other.requirement[:40]}) — nothing was imported")
+            return
+        if fn.name and fn.name != existing.name:
+            # The name is being adopted, not merely compared, so it has to be free.
+            # Checking ownership only when `existing` already carried a name let a nameless
+            # stored function take a name a third function owned; `get`/`call` then quietly
+            # resolved to the newcomer.
+            if existing.name:
+                raise NameTaken(
+                    f"{existing.ref} is already stored as {existing.name!r} and the bundle "
+                    f"calls it {fn.name!r} — one function, one name; nothing was imported")
+            if (other := self.by_name(fn.name)) is not None:
+                raise NameTaken(
+                    f"the name {fn.name!r} is already taken by {other.handle} "
+                    f"({other.requirement[:40]}) — nothing was imported")
+        for v in fn.versions:
+            cur = existing.version(v.name)
+            if cur is not None and cur.code.strip() != v.code.strip():
+                raise BundleConflict(
+                    f"{existing.ref} already has {v.name} with different code — refusing "
+                    "to mix two implementations under one version number; nothing was imported")
+
+    def adopt(self, fn: Function) -> tuple[Function, int, int]:
+        """Store an imported function: add what is missing, overwrite nothing.
+
+        A bundle is a file someone can edit, so the merge is deliberately conservative:
+        a version that is already here with **different code** is a hard refusal (two
+        implementations under one version number would make `rank@v1` mean two things),
+        the same version with the same code is skipped so importing twice is a no-op, and
+        a name another function owns is refused rather than reassigned.
+
+        Returns `(function now on the shelf, versions added, cases added)`.
+        """
+        existing = self.existing_for(fn.spec_hash)
+        self.adoptable(fn, existing)
+
+        if existing is None:
+            self.save_spec(fn)
+            self.save_tests(fn)
+            for v in fn.versions:
+                self.save_version(fn, v)
+            return fn, len(fn.versions), len(fn.tests.examples)
+
+        target = existing
+        if fn.name and not target.name:
+            target.name = fn.name
+            self.save_spec(target)
+        added_versions = 0
+        for v in fn.versions:
+            if target.version(v.name) is None:
+                target.versions.append(v)
+                self.save_version(target, v)
+                added_versions += 1
+        added_cases = sum(1 for ex in fn.tests.examples if target.tests.add(ex))
+        if added_cases:
+            self.save_tests(target)
+        return target, added_versions, added_cases

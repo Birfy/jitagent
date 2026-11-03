@@ -238,6 +238,73 @@ def cmd_get(args) -> int:
     return 0
 
 
+def cmd_export(args) -> int:
+    """Write one compiled function out as a single deterministic JSON file."""
+    from . import bundle
+    from .registry import Registry
+
+    fn = Registry(args.home).get(args.handle)
+    if fn is None:
+        print(f"no such function: {args.handle!r}", file=sys.stderr)
+        return 1
+    text = bundle.dumps(fn)
+    if not args.out:
+        sys.stdout.write(text)
+        return 0
+    replaced = Path(args.out).exists()
+    # The bundle is UTF-8 by definition (`dumps` uses ensure_ascii=False, `parse` reads
+    # utf-8), so the write must name the codec: the platform default would fail the
+    # round trip on a non-UTF-8 locale, or fail the write outright.
+    try:
+        Path(args.out).write_text(text, encoding="utf-8")
+    except UnicodeEncodeError as e:
+        print(f"cannot write {args.out!r}: not UTF-8 text ({e})", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"cannot write {args.out!r}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    print(f"wrote {args.out}{'  (replaced the file that was there)' if replaced else ''}"
+          f"   ({fn.ref}: {len(fn.versions)} version(s), {len(fn.tests.examples)} case(s))")
+    return 0
+
+
+def cmd_import(args) -> int:
+    """Load a bundle, re-verifying every version here before anything is stored."""
+    from . import bundle
+    from .registry import BundleConflict, NameTaken, Registry
+
+    path = Path(args.bundle)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"cannot read {str(path)!r}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    except UnicodeDecodeError as e:
+        print(f"cannot read {str(path)!r}: not UTF-8 text ({e})", file=sys.stderr)
+        return 1
+    registry = Registry(args.home)
+    try:
+        fn = bundle.parse(text)
+        # Refuse a name or version clash *before* the bundle's code runs here: a file that
+        # cannot be stored has no business executing.
+        registry.adoptable(fn)
+        bundle.reverify(fn)
+        target, new_versions, new_cases = registry.adopt(fn)
+    except (bundle.BadBundle, NameTaken, BundleConflict) as e:
+        print(e, file=sys.stderr)
+        return 1
+    except OSError as e:
+        # Belt and braces: everything a malicious value could make unwritable is refused
+        # at parse time, but a full disk or a hostile pre-existing file must still be one
+        # line rather than a traceback.
+        print(f"cannot store the imported function: {e.strerror or e}", file=sys.stderr)
+        return 1
+    print(f"imported {target.ref} ({target.handle}): {new_versions} new version(s), "
+          f"{new_cases} new case(s) — now {len(target.versions)} version(s), "
+          f"{len(target.tests.examples)} case(s)")
+    return 0
+
+
 def cmd_call(args) -> int:
     from .registry import Registry
     from .runtime import Runtime, UnknownHandle
@@ -283,6 +350,17 @@ def main(argv=None) -> int:
     g = sub.add_parser("get", help="print the source for a name")
     g.add_argument("name")
     g.set_defaults(fn=cmd_get)
+
+    ex = sub.add_parser("export", help="write a compiled function to one JSON file")
+    ex.add_argument("handle")
+    ex.add_argument("-o", "--out", default=None,
+                    help="write the bundle here (default: stdout)")
+    ex.set_defaults(fn=cmd_export)
+
+    im = sub.add_parser("import", help="verify every version of a bundle here, then store it")
+    im.add_argument("bundle", help="the file `jitagent export` wrote; its code is run "
+                                   "here in the verification sandbox")
+    im.set_defaults(fn=cmd_import)
 
     cl = sub.add_parser("call", help="run a compiled function in the sandbox")
     cl.add_argument("handle")

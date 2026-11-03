@@ -3,6 +3,50 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Export and import
+
+- `jitagent export NAME -o FILE` writes one compiled function to a single JSON bundle:
+  the requirement, the inferred `Spec`, every case with its `origin` and `assumes`, and
+  every version's code and verification report. The format is `jitagent.bundle/1`; keys
+  are sorted and versions are ordered by number, so two exports of one function are
+  byte-identical and a committed bundle diffs as a change to the case set. `-o` writes
+  the file named (saying so when it replaces one); without `-o` the bundle goes to stdout.
+- `jitagent import FILE` loads a bundle on another machine — and **re-verifies it
+  instead of trusting it**: the static check, every case in the bundle and the return
+  schema run in the local sandbox before anything is written. A tampered code or
+  expected value is refused with the failing gate and case, exit 1, and nothing stored.
+- Importing into a registry that already holds the same function merges only what is
+  missing: versions it does not have are added with their `origin`/`assumes` intact and
+  their version numbers preserved; identical versions are skipped, so importing twice
+  changes nothing. A different implementation under an existing version name, or a name
+  another function owns, is refused rather than overwritten.
+- Refusals — unknown format version, malformed JSON, a `spec_hash` that disagrees with
+  the bundle's own contents, a bundle with no versions — are one line on stderr and
+  exit 1, not a traceback.
+- The bundle file is UTF-8 on disk: `export` names that codec instead of taking the
+  platform default, so a requirement, name or case value with non-ASCII text is written
+  as UTF-8 bytes and the same file imports back unchanged on any locale, including
+  Windows.
+- An imported file cannot pick the limits it runs under: `import` verifies with this
+  machine's timeout and memory ceiling whatever the bundle's `spec` says (and refuses a
+  spec outside sane bounds), caps a bundle at 100 versions and 120 seconds of
+  verification, requires a printable name without `@` that a command can look up again,
+  and bounds version names so no entry can overflow a path or an `int`. Pathological
+  files — deeply nested JSON, absurd versions — are one line and exit 1, not a traceback.
+- A bundle's JSON Schemas cannot point outside the file. `import` refuses `$ref`,
+  `$dynamicRef` and `$recursiveRef` anywhere in `param_schema` or `return_schema` — nested
+  under `properties`, `items` or `allOf` included — as one line, and every place that applies
+  a schema validates against a registry with no retriever, so a bundle can never make the
+  importer fetch a URL, read a local file, or stall in `urlopen` (which has no timeout).
+  Schemas this tool generates contain no references, so no bundle `jitagent export` writes
+  is refused.
+- Everything a bundle stores is UTF-8: a lone surrogate in the requirement, name,
+  `created_at`, `assumes` or a case value is refused at parse with one line instead of
+  failing inside the registry write, and the registry reads and writes UTF-8, so a
+  non-ASCII bundle still imports on a machine whose locale is ASCII.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
