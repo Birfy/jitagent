@@ -44,8 +44,9 @@ from jitagent.cli import main
 # there and the 129-deep test carries the contract on every supported version.
 DEEP_CASE_3_11 = pytest.mark.skipif(
     sys.version_info < (3, 12),
-    reason="3.11's json decoder is recursive: a 1000-deep case file cannot be loaded "
-           "on that version, with or without this fix (#18 is the printer, not the parser)")
+    reason="on 3.11 a 1000-deep case file cannot be set up at all: Case.load's json.loads "
+           "raises RecursionError (json/decoder.py:353 in CI) before the printer exists, "
+           "with or without this fix (#18 is the printer, not the parser)")
 
 RAISER = "def solve(params, ctx):\n    raise ValueError('boom')\n"
 WRONG = "def solve(params, ctx):\n    return 2\n"
