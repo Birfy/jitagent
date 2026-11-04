@@ -37,16 +37,18 @@ import pytest
 from jitagent import Spec, verify
 from jitagent.cli import main
 
-# 3.11's `json` here takes the pure-Python paths, which are recursive in *both*
-# directions: a 1,000-deep case file cannot be **loaded** (`Case.load`), so the reported
-# reproduction cannot even be set up on 3.11 — before and after this fix alike. That is a
-# pre-existing parser limit, not what #18 is about, so the 1,000-deep cases are skipped
-# there and the 129-deep test carries the contract on every supported version.
+# 3.11's C json scanner and encoder are recursive (3.12 replaced both), so a 1,000-deep
+# case file cannot be **loaded** (`Case.load`) there at all: the reported reproduction
+# cannot even be set up on 3.11 — before and after this fix alike. That is a pre-existing
+# parser limit, not what #18 is about, so the 1,000-deep cases are skipped there and the
+# 129-deep test carries the contract on every supported version.
 DEEP_CASE_3_11 = pytest.mark.skipif(
     sys.version_info < (3, 12),
-    reason="on 3.11 a 1000-deep case file cannot be set up at all: Case.load's json.loads "
-           "raises RecursionError (json/decoder.py:353 in CI) before the printer exists, "
-           "with or without this fix (#18 is the printer, not the parser)")
+    reason="3.11's C json scanner and encoder are recursive, so a 1000-deep case file "
+           "cannot be loaded there at all (Case.load raises RecursionError at "
+           "json/decoder.py:353, run 41834451731) before the printer exists, with or "
+           "without this fix (#18 is the printer, not the parser)")
+
 
 RAISER = "def solve(params, ctx):\n    raise ValueError('boom')\n"
 WRONG = "def solve(params, ctx):\n    return 2\n"
