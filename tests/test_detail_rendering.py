@@ -30,9 +30,22 @@ sandbox's own serialisation of the input survives that depth at the default recu
 limit, so the 10 000-level report is built in memory and run through the same printer.
 """
 import json
+import sys
+
+import pytest
 
 from jitagent import Spec, verify
 from jitagent.cli import main
+
+# 3.11's `json` here takes the pure-Python paths, which are recursive in *both*
+# directions: a 1,000-deep case file cannot be **loaded** (`Case.load`), so the reported
+# reproduction cannot even be set up on 3.11 — before and after this fix alike. That is a
+# pre-existing parser limit, not what #18 is about, so the 1,000-deep cases are skipped
+# there and the 129-deep test carries the contract on every supported version.
+DEEP_CASE_3_11 = pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="3.11's json decoder is recursive: a 1000-deep case file cannot be loaded "
+           "on that version, with or without this fix (#18 is the printer, not the parser)")
 
 RAISER = "def solve(params, ctx):\n    raise ValueError('boom')\n"
 WRONG = "def solve(params, ctx):\n    return 2\n"
@@ -126,6 +139,7 @@ def test_a_hundred_and_twenty_nine_deep_input_prints_the_marker(tmp_path, capsys
 
 
 # --- the CLI must survive the deep entry --------------------------------------------
+@DEEP_CASE_3_11
 def test_verify_does_not_traceback_on_a_thousand_deep_input(tmp_path, capsys):
     """The reported reproduction: 1000 levels in `input`, an implementation that returns
     the wrong scalar. `REJECTED` is computed correctly; the crash is in the dump of the
@@ -145,6 +159,7 @@ def test_verify_does_not_traceback_on_a_thousand_deep_input(tmp_path, capsys):
     assert len(out.splitlines()) < 40, "the whole verify output must stay bounded"
 
 
+@DEEP_CASE_3_11
 def test_a_deep_expected_after_a_raising_impl_is_bounded(tmp_path, capsys):
     """The other entry shape: the implementation raises, so `_failures` records the error
     branch (`actual: None`, `expected` retained). The deep input rides along in both
@@ -162,6 +177,7 @@ def test_a_deep_expected_after_a_raising_impl_is_bounded(tmp_path, capsys):
     assert len(out.splitlines()) < 40
 
 
+@DEEP_CASE_3_11
 def test_the_rendered_detail_is_bounded_not_merely_survivable(tmp_path, capsys):
     """Bounded means the same output regardless of how deep the value goes, not "short
     enough that the traceback is hidden".
@@ -219,6 +235,7 @@ def test_a_shallow_entry_still_prints_its_full_detail(tmp_path, capsys):
         assert marker not in out
 
 
+@DEEP_CASE_3_11
 def test_the_report_keeps_the_value_the_printer_elides(tmp_path):
     """**Passes on the unfixed tree too** — a pin. `_print_details` may elide; the
     `Report` must still hand the real input to an API caller (that value is what the next
