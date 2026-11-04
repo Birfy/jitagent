@@ -97,7 +97,8 @@ class TestSet:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "TestSet":
-        return cls(examples=[Example.from_dict(e) for e in d.get("examples", [])])
+        return cls(examples=[Example.from_dict(e, i)
+                             for i, e in enumerate(d.get("examples", []))])
 
 
 @dataclass
