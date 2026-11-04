@@ -59,19 +59,70 @@ def depth_and_leaf(value):
     return depth, value
 
 
+def deep_text(levels):
+    """The JSON text of `deep(levels)`, built without an encoder.
+
+    `json.dumps` is not usable here: on 3.11 it takes the recursive Python path for a
+    plain `dumps`, so *writing* this fixture would raise the very `RecursionError` the
+    tests are about — before the code under test runs (that is what reddened this file's
+    first CI run on 3.11 while 3.12/3.13 passed). Splicing the literal in keeps the
+    fixture honest: the depth is still 1000, only the writer is iterative.
+    """
+    return '{"a":' * levels + "1" + "}" * levels
+
+
+DEEP_SENTINEL = "__DEEP_INPUT__"
+
+
 def case_dir(root, name, depth, impl=WRONG):
     d = root / name
     d.mkdir()
     (d / "impl.py").write_text(impl)
-    (d / "case.json").write_text(json.dumps({
+    payload = {
         "name": name,
         "why": "a deep caller input must not be printed as a traceback",
         "impl": "impl.py",
         "spec": SPEC,
-        "examples": [{"input": deep(depth), "output": 1}],
+        "examples": [{"input": DEEP_SENTINEL, "output": 1}],
+        "expect": {"level": "REJECTED"},
+    }
+    text = json.dumps(payload)
+    assert DEEP_SENTINEL in text, "the sentinel must survive the dump to be spliced"
+    (d / "case.json").write_text(text.replace(f'"{DEEP_SENTINEL}"', deep_text(depth)))
+    return d
+
+
+# --- the primary red: 129 levels, shallow enough for every supported version -------
+def test_a_hundred_and_twenty_nine_deep_input_prints_the_marker(tmp_path, capsys):
+    """The red test that a supported Python can always carry.
+
+    One level past `MAX_RENDER_DEPTH`, authored with a plain `json.dumps` — no deep
+    fixture writer, no deep sandbox payload, so it runs on 3.11 as well. On the unfixed
+    tree the whole 129-deep value is printed and there is no marker; with the fix it is
+    one line. The 1000-deep case below is the reported reproduction; this one is the
+    contract.
+    """
+    from jitagent import cli
+
+    marker = getattr(cli, "ELIDED", "<nests deeper than 128 levels — not shown>")
+    d = tmp_path / "case129"
+    d.mkdir()
+    (d / "impl.py").write_text(WRONG)
+    (d / "case.json").write_text(json.dumps({
+        "name": "case129",
+        "why": "one level past the render cap",
+        "impl": "impl.py",
+        "spec": SPEC,
+        "examples": [{"input": deep(129), "output": 1}],
         "expect": {"level": "REJECTED"},
     }))
-    return d
+
+    assert main(["verify", str(d)]) == 1
+    out, err = capsys.readouterr()
+    assert "Traceback" not in out + err
+    assert "REJECTED" in out
+    assert marker in out
+    assert len(out.splitlines()) < 40
 
 
 # --- the CLI must survive the deep entry --------------------------------------------
