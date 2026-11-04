@@ -15,6 +15,13 @@ the comparison actually happens (`verify._failures`, `lookup.reverify`). The exa
 strings are asserted on purpose: "refused" is only useful if the person holding the
 requirement file is told *which* value and *what* the limit is.
 
+Security found the mirror image of the same bug: the cap was enforced on **load** but
+not on **store**, so `Registry.put` could write an example that `_load` then refuses —
+and because the refusal is per function, one bad generated case made `get`/`list` fail
+for the whole home. So the store side drops such a case too, silently: a generated case
+the tool cannot judge is not worth a failed compile, and a store must not hold what it
+would refuse to read back.
+
 Two tests here are **pins, not coverage** — they pass on the unfixed tree and must keep
 passing:
 
@@ -360,3 +367,67 @@ def test_the_read_path_refuses_a_registry_stored_before_the_cap(tmp_path, capsys
     # Nothing migrated: a refused read leaves the stored test set exactly as it was.
     assert {p.name: (p / "tests.json").read_text()
             for p in home.iterdir() if p.is_dir()} == before
+
+
+# --- the write path: a store must not hold what the loader refuses -------------------
+def test_the_store_refuses_an_example_it_would_not_read_back(tmp_path, sb, capsys):
+    """Security's follow-up: the cap guards loading but not storing, so `Registry.put`
+    could write an example that `_load` then refuses. The refusal is per function but
+    `list`/`get` walk every function, so one deep generated case takes the whole home
+    down — the store has to drop it before the write, without raising.
+
+    Red before the fix: `Registry(home).get("deepfn")` raises `ExampleTooDeep` here.
+    """
+    from jitagent.llm import ScriptedClient
+    from jitagent.registry import Registry
+    from jitagent.synth import compile_function
+    from jitagent.types import MAX_VALUE_DEPTH, nesting_depth
+
+    home = tmp_path / "registry"
+    reg = Registry(home)
+    r = compile_function(SORT_REQ, SORT_EXAMPLES, client=ScriptedClient([SORT_CODE]),
+                         sandbox=sb)
+    assert r.ok, r.render()
+
+    deep = Example({"x": nested(1, 200)}, {}, origin="generated")
+    assert nesting_depth(deep.input) > MAX_VALUE_DEPTH
+    reg.put(SORT_REQ, r.spec, r.code, r.report, [deep], name="deepfn")
+
+    stored = next(p for p in home.iterdir() if (p / "spec.json").exists())
+    saved = json.loads((stored / "tests.json").read_text())["examples"]
+    assert [ex for ex in saved
+            if nesting_depth(ex["input"]) > MAX_VALUE_DEPTH
+            or nesting_depth(ex["output"]) > MAX_VALUE_DEPTH] == []
+    # The only case offered was too deep, so the stored set is empty — a silent drop,
+    # not a repaired or truncated value.
+    assert saved == []
+
+    fn = Registry(home).get("deepfn")          # must not raise ExampleTooDeep
+    assert fn is not None and fn.name == "deepfn"
+
+    assert main(["--home", str(home), "list"]) == 0
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err
+    assert "deepfn" in captured.out
+
+
+def test_testset_add_drops_an_example_that_is_too_deep():
+    """The store-side gate on its own. `TestSet.add` is where `Registry.put` feeds
+    examples in, so the depth check has to live here as well as in `put`'s filter —
+    otherwise the next caller of `add` reintroduces the bug.
+
+    The boundary is referenced through `MAX_VALUE_DEPTH`, not written as 128, so the
+    cap can move in one place.
+    """
+    from jitagent.registry import TestSet
+    from jitagent.types import MAX_VALUE_DEPTH
+
+    ts = TestSet()
+    assert ts.add(Example({"x": nested(1, 200)}, {}, origin="generated")) is False
+    assert ts.examples == []
+
+    assert TestSet().add(Example({"x": 1}, {"y": 2})) is True
+    assert TestSet().add(Example(nested(1, MAX_VALUE_DEPTH), {})) is True
+    assert TestSet().add(Example(nested(1, MAX_VALUE_DEPTH + 1), {})) is False
+    assert TestSet().add(Example({}, nested(1, MAX_VALUE_DEPTH))) is True
+    assert TestSet().add(Example({}, nested(1, MAX_VALUE_DEPTH + 1))) is False
