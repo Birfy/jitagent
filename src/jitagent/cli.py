@@ -8,7 +8,7 @@ from pathlib import Path
 import json as _json
 
 from .cases import Case, load_all
-from .types import Example
+from .types import Example, ExampleTooDeep
 from .verify import Thresholds, verify
 
 # The corpus ships inside the package. It used to be resolved relative to the source
@@ -77,7 +77,11 @@ def cmd_compile(args) -> int:
     from .registry import Registry
 
     meta = _json.loads(Path(args.requirement).read_text())
-    examples = [Example.from_dict(e) for e in meta["examples"]]
+    try:
+        examples = [Example.from_dict(e, i) for i, e in enumerate(meta["examples"])]
+    except ExampleTooDeep as e:
+        print(e, file=sys.stderr)
+        return 1
 
     print(f"requirement  {meta['requirement'][:86]}")
     print(f"seeds        {len(examples)}   model {args.model}   "
@@ -314,7 +318,13 @@ def main(argv=None) -> int:
     if getattr(args, "model", "sentinel") is None:
         from .llm import DEFAULT_MODEL
         args.model = DEFAULT_MODEL
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except ExampleTooDeep as e:
+        # A registry written before the depth cap can still hold one of these; a read
+        # path should say so in one line, not traceback.
+        print(e, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
