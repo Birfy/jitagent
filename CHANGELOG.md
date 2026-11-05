@@ -3,6 +3,18 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- `jitagent verify <case-dir>` now answers a broken case directory in one sentence and
+  **exit code 2**, where it used to print a traceback: a missing or unreadable
+  `case.json`, invalid JSON, a top level that is not an object, a missing
+  `spec`/`examples`/`expect` (or `expect.level`), an unknown key in `spec` or an
+  example, an `examples` value that is not a list, an example that is not an object or
+  lacks `input`/`output`, a missing implementation file, and a file that is not UTF-8
+  (the classic Windows save). Valid cases render exactly as before.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
