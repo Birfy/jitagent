@@ -7,7 +7,7 @@ from pathlib import Path
 
 import json as _json
 
-from .cases import Case, load_all
+from .cases import Case, CaseError, load_all
 from .types import Example
 from .verify import Thresholds, verify
 
@@ -29,7 +29,11 @@ def _print_details(report, verbose: bool) -> None:
 
 
 def cmd_verify(args) -> int:
-    case = Case.load(Path(args.case))
+    try:
+        case = Case.load(Path(args.case))
+    except CaseError as e:
+        print(e, file=sys.stderr)
+        return 2
     report = verify(case.source, case.spec, case.examples)
     print(f"== {case.name} ==")
     print(report.render())
