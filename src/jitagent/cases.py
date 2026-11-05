@@ -68,6 +68,8 @@ class Case:
             meta = json.loads(raw)
         except json.JSONDecodeError as e:
             raise CaseError(f"{str(meta_path)!r} is not valid JSON: {e}") from None
+        except RecursionError:
+            raise CaseError(f"{str(meta_path)!r} nests too deeply to parse") from None
         if not isinstance(meta, dict):
             kind = _kind(meta)
             raise CaseError(

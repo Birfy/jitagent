@@ -12,8 +12,9 @@ is 0, the API may change in a minor release.
   `case.json`, invalid JSON, a top level that is not an object, a missing
   `spec`/`examples`/`expect` (or `expect.level`), an unknown key in `spec` or an
   example, an `examples` value that is not a list, an example that is not an object or
-  lacks `input`/`output`, a missing implementation file, and a file that is not UTF-8
-  (the classic Windows save). Valid cases render exactly as before.
+  lacks `input`/`output`, a missing implementation file, a file that is not UTF-8
+  (the classic Windows save), and a file nested too deeply to parse. Valid cases render
+  exactly as before.
 
 ## [0.0.1] — 2026-09-16
 

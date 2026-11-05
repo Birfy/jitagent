@@ -94,6 +94,18 @@ def test_a_case_file_that_is_not_utf8_is_a_usage_error(tmp_path, capsys):
     assert "cannot read" in line
 
 
+def test_a_case_file_nested_too_deeply_is_a_usage_error(tmp_path, capsys):
+    """Past the stack limit `json.loads` raises `RecursionError`, not `JSONDecodeError`,
+    so it is a third kind of unreadable file. A case file is exactly where deep nesting
+    arrives — this repo's #16/#18 are reports about deep values, and whoever reproduces
+    them writes one. 50,000 levels is far past any stack and cheap to write as text;
+    dumping a deep object here would test the writer instead of the loader."""
+    d = write_case(tmp_path)
+    (d / "case.json").write_text("[" * 50_000 + "]" * 50_000)
+    line = assert_refused(capsys, run_verify(tmp_path, d), d / "case.json",
+                          "nests too deeply to parse")
+
+
 def test_invalid_json_names_the_line_and_column(tmp_path, capsys):
     d = write_case(tmp_path, text='{"name": "add",\n "spec": {},')
     line = assert_refused(capsys, run_verify(tmp_path, d), d / "case.json",
