@@ -3,6 +3,15 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- A stored name must be a reference every command can type back: `--name` now refuses
+  `@`, leading or trailing whitespace and control characters instead of keeping a
+  function that nothing can reach (and, on a cache hit, overwriting the name that did
+  work). Applies to `Registry.put` and to the cache-hit rename alike.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
