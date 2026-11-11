@@ -129,13 +129,69 @@ def cmd_selftest(args) -> int:
     return 1 if bad else 0
 
 
+class BadRequirement(RuntimeError):
+    """The requirement file cannot be used as given; the message says why."""
+
+
+def _json_kind(value) -> str:
+    return {dict: "an object", list: "an array", str: "a string",
+            bool: "a boolean", type(None): "null"}.get(type(value), "a number")
+
+
+def _load_requirement(path: str):
+    """Read a requirement file, or raise BadRequirement with a one-line reason.
+
+    `compile` takes hand-edited JSON, so a wrong path, a stray comma or a missing key
+    is the ordinary first failure, not an edge case. Each of those used to surface as
+    a traceback, which reads as a broken program rather than a wrong file.
+    """
+    p = Path(path)
+    try:
+        raw = p.read_text()
+    except OSError as e:
+        raise BadRequirement(f"cannot read {path!r}: {e.strerror or e}") from e
+    except UnicodeDecodeError as e:
+        # A UTF-16 save or a binary file lands here; it is not JSON either, but the
+        # decoder fails first, and that is the more useful thing to say.
+        raise BadRequirement(f"cannot read {path!r}: not UTF-8 text ({e})") from e
+    try:
+        meta = _json.loads(raw)
+    except ValueError as e:
+        raise BadRequirement(f"{path!r} is not valid JSON: {e}") from e
+    if not isinstance(meta, dict):
+        raise BadRequirement(
+            f'{path!r} must hold a JSON object with "requirement" and "examples", '
+            f"not {_json_kind(meta)}")
+    if not isinstance(meta.get("requirement"), str) or not meta["requirement"].strip():
+        raise BadRequirement(f'{path!r} needs "requirement" to be a non-empty string')
+    seeds = meta.get("examples")
+    if not isinstance(seeds, list):
+        raise BadRequirement(f'{path!r} needs "examples" to be a list of seeds')
+    examples = []
+    for i, seed in enumerate(seeds):
+        try:
+            examples.append(Example.from_dict(seed))
+        except KeyError as e:
+            raise BadRequirement(
+                f'{path!r}: example {i} needs both "input" and "output" '
+                f"(missing {e.args[0]!r})") from e
+        except (TypeError, AttributeError) as e:
+            raise BadRequirement(
+                f'{path!r}: example {i} needs to be an object with "input" and '
+                f'"output" ({e})') from e
+    return meta, examples
+
+
 def cmd_compile(args) -> int:
     """Look in the cache first; only synthesise on a miss. Only that path costs tokens."""
     from .jit import compile_function
     from .registry import Registry
 
-    meta = _json.loads(Path(args.requirement).read_text())
-    examples = [Example.from_dict(e) for e in meta["examples"]]
+    try:
+        meta, examples = _load_requirement(args.requirement)
+    except BadRequirement as e:
+        print(e, file=sys.stderr)
+        return 2
 
     print(f"requirement  {meta['requirement'][:86]}")
     print(f"seeds        {len(examples)}   model {args.model}   "
