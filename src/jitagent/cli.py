@@ -296,14 +296,46 @@ def cmd_get(args) -> int:
     return 0
 
 
+def _call_payload(raw: str) -> str:
+    """The payload for `call`: a JSON literal, or a path to a file containing one.
+
+    **JSON is tried first, and that order is the fix, not a detail.** Calling one
+    function on many records is the whole point, so the literal routinely runs past
+    NAME_MAX (255 bytes on Linux) — and `Path(...).exists()` raises `OSError: File name
+    too long` on such a string before `json.loads` is ever reached. Asking the
+    filesystem first also gives a file precedence over a JSON literal that happens to
+    name it, which is the wrong way round.
+
+    The file branch is guarded too: not every string is a legal path (`ValueError` on a
+    NUL, `OSError` on anything over-long), and the answer to "neither" has to be one
+    clear error rather than a traceback.
+    """
+    try:
+        _json.loads(raw)
+        return raw
+    except ValueError:
+        pass
+    try:
+        path = Path(raw)
+        if path.is_file():
+            return path.read_text()
+    except (OSError, ValueError):
+        pass
+    raise ValueError("neither a JSON payload nor a readable JSON file")
+
+
 def cmd_call(args) -> int:
     from .registry import Registry
     from .runtime import Runtime, UnknownHandle
 
     rt = Runtime(Registry(args.home))
-    payload = Path(args.args).read_text() if Path(args.args).exists() else args.args
     try:
-        out = rt.call(args.handle, _json.loads(payload))
+        payload = _json.loads(_call_payload(args.args))
+    except ValueError as e:
+        print(f"bad arguments: {e}", file=sys.stderr)
+        return 1
+    try:
+        out = rt.call(args.handle, payload)
     except UnknownHandle as e:
         print(e, file=sys.stderr)
         return 1

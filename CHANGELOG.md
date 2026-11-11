@@ -3,6 +3,16 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- `jitagent call` now reads its argument as JSON **before** asking the filesystem. An
+  inline payload longer than NAME_MAX (255 bytes on Linux) used to raise
+  `OSError: File name too long` inside `Path(...).exists()`, so an ordinary batch call —
+  the thing the registry exists for — needed a temp file. A string that is neither JSON
+  nor a readable file is now a one-line error instead of a traceback.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
