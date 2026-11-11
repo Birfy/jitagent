@@ -21,6 +21,18 @@ class Level(str, Enum):
     VERIFIED = "VERIFIED"        # passed every test case
 
 
+# How deep a value may nest before comparing it stops being meaningful. `deep_equal`
+# is recursive, so an absurd depth is a `RecursionError` rather than a verdict; the parse
+# points refuse at this limit and the comparison sites say "cannot compare".
+MAX_VALUE_DEPTH = 128
+
+UNCOMPARABLE = f"the value nests deeper than {MAX_VALUE_DEPTH} levels — too deep to compare"
+
+
+class ExampleTooDeep(ValueError):
+    """An input or output nests deeper than `MAX_VALUE_DEPTH` — deeper than we compare."""
+
+
 @dataclass
 class Example:
     """One input/output criterion."""
@@ -49,7 +61,13 @@ class Example:
                 "assumes": self.assumes}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Example":
+    def from_dict(cls, d: dict[str, Any], index: int | None = None) -> "Example":
+        for field in ("input", "output"):
+            if nesting_depth(d[field]) > MAX_VALUE_DEPTH:
+                where = f"examples[{index}]" if index is not None else "example"
+                raise ExampleTooDeep(
+                    f"{where}.{field} nests deeper than {MAX_VALUE_DEPTH} levels — "
+                    "deeper than jitagent can compare")
         return cls(input=d["input"], output=d["output"], note=d.get("note", ""),
                    boundary=d.get("boundary", False), origin=d.get("origin", "caller"),
                    assumes=d.get("assumes", ""))
@@ -149,3 +167,22 @@ def deep_equal(a: Any, b: Any, rel_tol: float = 1e-9, abs_tol: float = 1e-12) ->
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(deep_equal(x, y, rel_tol, abs_tol) for x, y in zip(a, b))
     return a == b
+
+
+def nesting_depth(value: Any) -> int:
+    """How many containers deep `value` nests: 0 for a scalar, 1 for a container whose
+    children are all scalars, +1 per container inside it.
+
+    Iterative on purpose — the value handed in is exactly the one whose absurd depth
+    must not cost a recursion.
+    """
+    deepest = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if not isinstance(node, (dict, list)):
+            continue
+        deepest = max(deepest, depth)
+        children = node.values() if isinstance(node, dict) else node
+        stack.extend((c, depth + 1) for c in children if isinstance(c, (dict, list)))
+    return deepest
