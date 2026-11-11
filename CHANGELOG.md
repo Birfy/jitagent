@@ -3,6 +3,16 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- `jitagent get <name>@<version>` and `jitagent inspect <name>@<version> --code` now
+  return the version you pinned. `call` has always honoured the pin, but `get` resolved
+  the name through `split_ref`, which drops the version, and then printed the newest —
+  so reading `rank@v1` gave you v2's source, silently. A version that does not exist is
+  now an error that lists the versions that do, instead of a fallback to the newest.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
