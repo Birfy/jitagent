@@ -3,6 +3,17 @@
 This project follows [Semantic Versioning](https://semver.org/). While the major version
 is 0, the API may change in a minor release.
 
+## [Unreleased]
+
+### Fixed
+
+- The static check's credential gate matched the **word** (`token`, `password`,
+  `api_key`) instead of the **value**. A function that reads `token = params["s"]` — an
+  ordinary local, and token counting is a normal requirement — was rejected before the
+  sandbox, while `k = "sk-..."` was accepted because the name beside the literal was not
+  a credential word. Credential-shaped strings are now rejected wherever they appear, and
+  a plain literal is rejected only when it is bound to a credential-named target.
+
 ## [0.0.1] — 2026-09-16
 
 First release. The loop round-trips: **a sentence goes in, code comes out, and you fetch
