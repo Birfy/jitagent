@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from .types import Example, Level, Report, Spec
+from .types import MAX_VALUE_DEPTH, Example, Level, Report, Spec, nesting_depth
 
 HANDLE_RE = re.compile(r"^(?:fn_)?([0-9a-f]{6,64})$")
 
@@ -86,6 +86,11 @@ class TestSet:
 
     def add(self, ex: Example) -> bool:
         """One entry per input. True means it was new."""
+        if (nesting_depth(ex.input) > MAX_VALUE_DEPTH
+                or nesting_depth(ex.output) > MAX_VALUE_DEPTH):
+            # The loader refuses this case, so storing it would make the function —
+            # and every read that touches it — unreadable. Not worth keeping.
+            return False
         key = _canon(ex.input)
         if any(_canon(e.input) == key for e in self.examples):
             return False
@@ -97,7 +102,8 @@ class TestSet:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "TestSet":
-        return cls(examples=[Example.from_dict(e) for e in d.get("examples", [])])
+        return cls(examples=[Example.from_dict(e, i)
+                             for i, e in enumerate(d.get("examples", []))])
 
 
 @dataclass
@@ -300,6 +306,11 @@ class Registry:
             self.save_spec(fn)
 
         for ex in examples:
+            # Never write a case the loader would refuse: a deep input is not compared
+            # by verify, so it can reach here, and one such case poisons the whole home.
+            if (nesting_depth(ex.input) > MAX_VALUE_DEPTH
+                    or nesting_depth(ex.output) > MAX_VALUE_DEPTH):
+                continue
             fn.tests.add(ex)
         self.save_tests(fn)
 

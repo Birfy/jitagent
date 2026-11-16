@@ -34,7 +34,8 @@ import jsonschema
 
 from .registry import Function, Registry, Version, spec_hash
 from .sandbox import Sandbox
-from .types import Example, Spec, deep_equal
+from .types import (MAX_VALUE_DEPTH, UNCOMPARABLE, Example, Spec, deep_equal,
+                    nesting_depth)
 
 # Candidates below this are not even worth looking at. Prefer missing one — a miss just
 # means synthesising.
@@ -215,7 +216,18 @@ def reverify(cand: Candidate, examples: list[Example], sb: Sandbox) -> bool:
         if not r.ok:
             cand.verdict, cand.why = "reverify", f"example {i} raised: {r.error}"
             return False
-        if not deep_equal(r.value, ex.output):
+        if (nesting_depth(ex.output) > MAX_VALUE_DEPTH
+                or nesting_depth(r.value) > MAX_VALUE_DEPTH):
+            cand.verdict, cand.why = "reverify", (
+                f"example {i} cannot be compared: {UNCOMPARABLE}")
+            return False
+        try:
+            equal = deep_equal(r.value, ex.output)
+        except RecursionError:
+            cand.verdict, cand.why = "reverify", (
+                f"example {i} cannot be compared: {UNCOMPARABLE}")
+            return False
+        if not equal:
             cand.verdict, cand.why = "reverify", (
                 f"example {i} disagrees: expected {ex.output!r}, got {r.value!r}")
             return False

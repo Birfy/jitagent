@@ -32,7 +32,8 @@ import jsonschema
 
 from . import static_check
 from .sandbox import RunResult, Sandbox
-from .types import Example, GateResult, Level, Report, Spec, deep_equal
+from .types import (MAX_VALUE_DEPTH, UNCOMPARABLE, Example, GateResult, Level, Report,
+                    Spec, deep_equal, nesting_depth)
 
 
 @dataclass
@@ -66,7 +67,21 @@ def _failures(run: RunResult, examples: list[Example]) -> list[dict]:
         if not r.ok:
             bad.append({"i": i, "origin": ex.origin, "input": ex.input,
                         "expected": ex.output, "actual": None, "error": r.error})
-        elif not deep_equal(r.value, ex.output):
+            continue
+        if (nesting_depth(ex.output) > MAX_VALUE_DEPTH
+                or nesting_depth(r.value) > MAX_VALUE_DEPTH):
+            bad.append({"i": i, "origin": ex.origin, "input": ex.input,
+                        "expected": None, "actual": None, "error": UNCOMPARABLE})
+            continue
+        try:
+            equal = deep_equal(r.value, ex.output)
+        except RecursionError:
+            # The values are left out on purpose: rendering or serialising them later
+            # would walk into the same recursion this just hit.
+            bad.append({"i": i, "origin": ex.origin, "input": ex.input,
+                        "expected": None, "actual": None, "error": UNCOMPARABLE})
+            continue
+        if not equal:
             bad.append({"i": i, "origin": ex.origin, "input": ex.input,
                         "expected": ex.output, "actual": r.value})
     return bad
