@@ -19,13 +19,71 @@ from .verify import Thresholds, verify
 CORPUS = Path(__file__).with_name("corpus")
 
 
+MAX_RENDER_DEPTH = 128
+ELIDED = f"<nests deeper than {MAX_RENDER_DEPTH} levels — not shown>"
+# The fields of a failure entry that carry the caller's own values. Everything else in
+# the entry (`i`, `origin`, `error`, and anything added later) is small and must print.
+DEEP_FIELDS = ("input", "expected", "actual")
+
+
+def _deeper_than(value, limit: int) -> bool:
+    """Whether `value` nests more than `limit` levels below itself.
+
+    Iterative on purpose: this runs on values deep enough to exhaust the stack of a
+    recursive walk, which is the whole problem being solved. It also stops at the first
+    node past the limit, so a deep value costs no more than `limit` steps of walking.
+    """
+    stack = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(node, dict):
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, list):
+            stack.extend((v, depth + 1) for v in node)
+    return False
+
+
+def _printable(detail):
+    """A copy of a gate's detail with values too deep to print replaced by `ELIDED`.
+
+    The bound belongs at the printer, not at the data: a gate's detail holds the
+    caller's real values, and an example may nest deeper than `json.dumps(indent=...)`
+    can encode. Only the fields that carry those values are replaced, each entry is a
+    new dict, and nothing the verdict, the model or the registry sees is altered.
+    """
+    if not isinstance(detail, dict):
+        return detail
+    failures = detail.get("failures")
+    if not isinstance(failures, list):
+        return detail
+    out = dict(detail)
+    out["failures"] = [
+        {k: (ELIDED if k in DEEP_FIELDS and _deeper_than(v, MAX_RENDER_DEPTH) else v)
+         for k, v in entry.items()}
+        if isinstance(entry, dict) else entry
+        for entry in failures
+    ]
+    return out
+
+
 def _print_details(report, verbose: bool) -> None:
     for g in report.gates:
         if g.passed or not g.detail:
             continue
         print(f"      {g.name}:")
-        print("      " + json.dumps(g.detail, ensure_ascii=False, indent=2,
-                                    default=str).replace("\n", "\n      ")[:1800])
+        # The bound is applied to the values, never to the encoded text: a character
+        # slice comes after `dumps` and so cannot stop the encoder recursing. `_printable`
+        # collapses a value too deep to print into one short line, which leaves the
+        # slice and the re-indent below exactly as they were.
+        printable = _printable(g.detail)
+        try:
+            rendered = json.dumps(printable, ensure_ascii=False, indent=2, default=str)
+        except RecursionError:
+            print("      <detail too deep to render>")
+            continue
+        print("      " + rendered.replace("\n", "\n      ")[:1800])
 
 
 def cmd_verify(args) -> int:
