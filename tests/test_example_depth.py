@@ -1,28 +1,35 @@
-"""A too-deep example value must be refused, not crash the verifier.
+"""A too-deep example is a failing case, not a broken file.
 
 `types.deep_equal` is recursive by design — it compares two JSON values structurally —
-and examples arrive from a hand-written requirement file with no nesting limit. So a
-case whose expected output nests 600 dict levels did not produce a verdict:
-`jitagent verify` printed a ~3000-line `RecursionError` traceback out of
-`verify._failures`. The exit code was 1, so nothing downstream was fooled, but the
-message was a stack trace instead of "this value is too deep to compare". The same
-unguarded call sits in `lookup.reverify`, which runs on every L2 candidate.
+so a 600-deep expected value used to crash the verifier with a ~3000-line
+`RecursionError` traceback instead of reporting "too deep to compare". The fix is a
+**named limit** (`types.MAX_VALUE_DEPTH`) with a **named message**
+(`types.UNCOMPARABLE`), enforced **where the comparison happens** (`verify._failures`,
+`lookup.reverify`) so a deep example becomes an ordinary failing case.
 
-The fix is a **named limit** (`types.MAX_VALUE_DEPTH`) with a **named message**
-(`types.UNCOMPARABLE`), enforced at the single parse point both callers go through
-(`Example.from_dict`: the requirement file and the stored `tests.json`) and again where
-the comparison actually happens (`verify._failures`, `lookup.reverify`). The exact
-strings are asserted on purpose: "refused" is only useful if the person holding the
-requirement file is told *which* value and *what* the limit is.
+Where the limit may *not* live is the parser. PR #21 gives `Case.load` a
+`Example.from_dict` parse step, and an earlier draft refused the value there — which
+meant `jitagent verify our-600-deep-case/` printed "deeper than 128 levels" and never
+rendered the verdict that #16/#18 are about. So the contract this file pins now:
 
-Security found the mirror image of the same bug: the cap was enforced on **load** but
-not on **store**, so `Registry.put` could write an example that `_load` then refuses —
-and because the refusal is per function, one bad generated case made `get`/`list` fail
-for the whole home. So the store side drops such a case too, silently: a generated case
-the tool cannot judge is not worth a failed compile, and a store must not hold what it
-would refuse to read back.
+* `Example.from_dict` accepts any depth: a case directory may legitimately hold a deep
+  example, and the server-side verdict is "0/1 passed" with the UNCOMPARABLE entry;
+* `verify` / `lookup.reverify` report the comparison as uncomparable, never a traceback,
+  at any depth;
+* exactly at `MAX_VALUE_DEPTH` the comparison is still a real comparison (the pinned
+  curve); 129 levels still **loads**, and is refused only by the **store** path:
+  `cmd_compile` refuses it in one line before the model runs, `Registry.put` /
+  `TestSet.add` drop it silently (a generated case the tool cannot judge must not enter
+  a store that would then report it as a failing case forever);
+* a `tests.json` written before the cap (one deep example) stays **readable**:
+  `list`/`get`/`inspect` return 0, nothing is migrated, and the deep example is handed
+  to the comparison as UNCOMPARABLE when it gets there.
 
-Two tests here are **pins, not coverage** — they pass on the unfixed tree and must keep
+The CLI-level tests deliberately go through `main([...])` only, and never import the
+case loader: they have to pass on `main + #17` (old `Case.load`, no `from_dict`) and on
+`main + #17 + #21` (new `Case.load`) alike.
+
+Two tests are **pins, not coverage** — they pass on the unfixed tree and must keep
 passing:
 
 * `test_deep_equal_still_compares_a_hundred_and_twenty_eight_levels`,
@@ -30,7 +37,7 @@ passing:
 
 They exist so a fix that simply refuses anything "deep-ish", or lowers the cap until the
 failing case goes away, cannot pass. Depth is legal data; only past the cap is it
-refused, and at the cap the comparison must still be a real comparison — a bool that
+uncomparable, and at the cap the comparison must still be a real comparison — a bool that
 answers `True` for the wrong reason (short-circuited, never compared) is a worse bug
 than the crash it replaced.
 """
@@ -41,7 +48,7 @@ import pytest
 
 from jitagent import Example, Sandbox, Spec, verify
 from jitagent.cli import main
-from jitagent.types import deep_equal
+from jitagent.types import MAX_VALUE_DEPTH, deep_equal
 
 DEEP_IMPL = ("def solve(params, ctx):\n"
              "    v = 1\n"
@@ -49,7 +56,7 @@ DEEP_IMPL = ("def solve(params, ctx):\n"
              "        v = {'k': v}\n"
              "    return v\n")
 
-REFUSAL = "nests deeper than 128 levels — deeper than jitagent can compare"
+REFUSAL = f"nests deeper than {MAX_VALUE_DEPTH} levels — deeper than jitagent can compare"
 
 # The same 600-deep value, produced regardless of the input — the reverify fixture below
 # wants the *output* to be the deep side, with an input the candidate can actually run.
@@ -59,10 +66,9 @@ FIXED_DEEP_IMPL = ("def solve(params, ctx):\n"
                    "        v = {'k': v}\n"
                    "    return v\n")
 
-# A small, real, cacheable function — the fixture for "a registry written before the cap"
-# below. It is only here so `list`/`get` have something to load; the stored test set gets
-# replaced by a deep example afterwards, which is exactly the situation the read path has
-# to survive.
+# A small, real, cacheable function — the fixture for the pre-cap registry below. It is
+# only here so `list`/`get` have something to load; the stored test set gets replaced by
+# a deep example afterwards, which is exactly the situation the read path has to survive.
 SORT_REQ = "Sort {rows} by descending score."
 SORT_EXAMPLES = [Example({"rows": [{"score": 1}, {"score": 5}]},
                          [{"score": 5}, {"score": 1}]),
@@ -81,6 +87,16 @@ def nested(value, levels):
     for _ in range(levels):
         value = {"k": value}
     return value
+
+
+def leaf_of(value):
+    """(depth, leaf) without recursion — comparing 600-deep dicts with `==` is a walk of
+    the same size this module is about, so the assertions descend explicitly."""
+    depth = 0
+    while isinstance(value, dict):
+        value = value["k"]
+        depth += 1
+    return depth, value
 
 
 @pytest.fixture(scope="module")
@@ -124,10 +140,9 @@ def test_verify_rejects_a_six_hundred_deep_expected_output():
     600-level value into the report, or reporting the failure becomes unrenderable in
     turn.
     """
-    ex = Example({"n": 600}, nested(1, 600))
-    report = verify(DEEP_IMPL, spec(), [ex])
-
     from jitagent.types import UNCOMPARABLE
+
+    report = verify(DEEP_IMPL, spec(), [Example({"n": 600}, nested(1, 600))])
 
     assert report.level.value == "REJECTED"
     gate = report.gate("examples")
@@ -147,9 +162,9 @@ def test_verify_rejects_a_six_hundred_deep_expected_output():
 
 
 def test_the_verify_command_reports_a_deep_case(tmp_path, capsys):
-    """The user-facing shape of the same defect: today `jitagent verify` prints ~3000
-    lines of RecursionError. rc 1 is correct either way (the case is rejected), which is
-    exactly why the "no traceback / says 0/1 passed" assertions are what catch it.
+    """The user-facing shape of the #16/#18 defect, and the #21 regression test: a case
+    directory holding a 600-deep expected value must reach the verdict, not be refused by
+    the loader. `Case.load` is deliberately not imported — the assertion is on the CLI.
     """
     d = case_dir(tmp_path, 600)
     assert main(["verify", str(d)]) == 1
@@ -162,46 +177,42 @@ def test_the_verify_command_reports_a_deep_case(tmp_path, capsys):
     assert "REJECTED" in captured.out
 
 
-# --- the parse point: both callers go through Example.from_dict ---------------------
-def test_from_dict_refuses_a_deep_output():
-    """The earliest gate, and the only one that can still name the value by index and
-    field. `index` is passed by the caller (`cli.py` enumerates the examples), because
-    `from_dict` sees one example and cannot know where it sat in the file.
+# --- the parse point: depth is accepted here, whatever the caller -------------------
+def test_from_dict_accepts_a_deep_output():
+    """The parser is not a gate. A case file written to reproduce #16/#18 has a deep
+    expected value, and refusing it here would make the case impossible to verify at
+    all — the refusal belongs to the store path (`check_example_depth`).
     """
-    from jitagent.types import ExampleTooDeep
+    from jitagent.types import nesting_depth
 
-    with pytest.raises(ExampleTooDeep) as excinfo:
-        Example.from_dict({"input": {"n": 1}, "output": nested(1, 600)}, 0)
+    ex = Example.from_dict({"input": {"n": 1}, "output": nested(1, 600)}, 0)
+    assert leaf_of(ex.output) == (600, 1)
+    assert nesting_depth(ex.output) == 600
+    assert ex.input == {"n": 1}
 
-    assert str(excinfo.value) == "examples[0].output " + REFUSAL
 
+def test_from_dict_accepts_a_deep_input():
+    """The other side, and both at once: an input the candidate cannot be compared with is
+    still data the loader must hand to `verify` (which reports it as uncomparable)."""
+    from jitagent.types import nesting_depth
 
-def test_from_dict_refuses_a_deep_input_before_the_output():
-    """`input` is compared by the same recursive function, so it needs the same gate —
-    and it is checked first: an example whose input *and* output are both too deep must
-    name the input, or the caller fixes one and gets refused again for the other.
-    """
-    from jitagent.types import ExampleTooDeep
-
-    with pytest.raises(ExampleTooDeep) as excinfo:
-        Example.from_dict({"input": nested(0, 600), "output": 1}, 1)
-    assert str(excinfo.value) == "examples[1].input " + REFUSAL
-
-    with pytest.raises(ExampleTooDeep) as excinfo:
-        Example.from_dict({"input": nested(0, 600), "output": nested(1, 600)}, 1)
-    assert str(excinfo.value) == "examples[1].input " + REFUSAL
+    ex = Example.from_dict({"input": nested(0, 600), "output": nested(1, 600)}, 1)
+    assert leaf_of(ex.input) == (600, 0)
+    assert leaf_of(ex.output) == (600, 1)
+    assert nesting_depth(ex.input) == 600
 
 
 @pytest.mark.parametrize("field", ["input", "output"])
 def test_the_cap_is_one_hundred_and_twenty_eight_levels(field):
-    """128 accepted, 129 refused, separately for each field.
+    """128 accepted, 129 **accepted on load**, and 129 refused by the store path.
 
-    The accepted side is a pin (it is what lets legitimately nested data through at
-    all); the refused side is the contract. Both fields are gated independently rather
-    than by their sum: a function's input and output are compared in separate calls, so
-    a 128-deep input with a 128-deep output is legal in one example.
+    The accepted side is a pin (it is what lets legitimately nested data through at all);
+    the refused side is the store contract, asserted through `check_example_depth` with
+    the exact message and index the requirement file gets. Both fields are gated
+    independently: a function's input and output are compared in separate calls, so a
+    128-deep input with a 128-deep output is legal in one example.
     """
-    from jitagent.types import ExampleTooDeep, MAX_VALUE_DEPTH
+    from jitagent.types import ExampleTooDeep, check_example_depth, nesting_depth
 
     assert MAX_VALUE_DEPTH == 128
 
@@ -209,18 +220,23 @@ def test_the_cap_is_one_hundred_and_twenty_eight_levels(field):
         return {"input": nested(0, depth) if field == "input" else {"n": 1},
                 "output": nested(1, depth) if field == "output" else 1}
 
-    ex = Example.from_dict(example(128), 0)
-    assert getattr(ex, field) == (nested(0, 128) if field == "input" else nested(1, 128))
+    at_cap = Example.from_dict(example(MAX_VALUE_DEPTH), 0)
+    assert nesting_depth(getattr(at_cap, field)) == MAX_VALUE_DEPTH
+
+    # 129 is legal data as far as the parser goes; only storing it is refused.
+    over = Example.from_dict(example(MAX_VALUE_DEPTH + 1), 0)
+    assert nesting_depth(getattr(over, field)) == MAX_VALUE_DEPTH + 1
 
     with pytest.raises(ExampleTooDeep) as excinfo:
-        Example.from_dict(example(129), 0)
+        check_example_depth(example(MAX_VALUE_DEPTH + 1), 0)
     assert str(excinfo.value) == f"examples[0].{field} " + REFUSAL
 
-    # Both at the cap in one example still passes: the gate is per value.
-    Example.from_dict({"input": nested(0, 128), "output": nested(1, 128)}, 0)
+    # Both at the cap in one example still passes storage: the gate is per value.
+    check_example_depth({"input": nested(0, MAX_VALUE_DEPTH),
+                         "output": nested(1, MAX_VALUE_DEPTH)}, 0)
 
 
-# --- pins on the curve: depth is not refused, only depth past the cap ---------------
+# --- pins on the curve: depth is not refused before the comparison ------------------
 def test_deep_equal_still_compares_a_hundred_and_twenty_eight_levels():
     """**Passes on the unfixed tree too** — a pin on the comparison, not coverage of it.
 
@@ -324,20 +340,19 @@ def test_cmd_compile_refuses_a_deep_requirement_before_the_model(tmp_path, monke
 
 
 # --- the read path: a registry written before the cap -------------------------------
-def test_the_read_path_refuses_a_registry_stored_before_the_cap(tmp_path, capsys):
-    """The cap is strict on load, so a registry written *before* the cap exists is the
-    case that decides what happens to somebody's existing data: it must not be a
-    traceback, and it must not be silently migrated or repaired either.
+def test_a_registry_stored_before_the_cap_is_readable(tmp_path, capsys, sb):
+    """A `tests.json` written before the cap exists is somebody's data, not a broken file.
 
-    `list`, `get`, `call` and `inspect` all go through `Registry._load` →
-    `TestSet.from_dict` → `Example.from_dict`, i.e. the same parse point as a requirement
-    file — which is why the message can still name `examples[0].output`: the index is the
-    position inside this function's stored test set. The stored file is byte-identical
-    afterwards, so the refusal is a read-time verdict, not a write.
+    `list`, `get` and `inspect` must load the home (the parse point accepts deep values),
+    leave the stored bytes untouched, and hand the deep example back to the caller. When
+    that example actually reaches a comparison — `reverify` here — it is a bounded,
+    reported UNCOMPARABLE, exactly like a hand-written case.
     """
     from jitagent.llm import ScriptedClient
-    from jitagent.registry import Registry
+    from jitagent.lookup import Candidate, reverify
+    from jitagent.registry import Registry, Version
     from jitagent.synth import compile_function
+    from jitagent.types import UNCOMPARABLE, Level, nesting_depth
 
     home = tmp_path / "registry"
     reg = Registry(home)
@@ -356,32 +371,47 @@ def test_the_read_path_refuses_a_registry_stored_before_the_cap(tmp_path, capsys
         json.dumps({"examples": [{"input": {"n": 600}, "output": nested(1, 600)}]}))
     before = {p.name: (p / "tests.json").read_text() for p in home.iterdir() if p.is_dir()}
 
-    expected = "examples[0].output " + REFUSAL
-
-    for argv in (["list"], ["get", "rank"], ["call", "rank", "{}"], ["inspect", "rank"]):
-        assert main(["--home", str(home), *argv]) == 1, argv
+    for argv in (["list"], ["get", "rank"], ["inspect", "rank"]):
+        assert main(["--home", str(home), *argv]) == 0, argv
         captured = capsys.readouterr()
-        assert "Traceback" not in captured.out + captured.err
-        assert [ln for ln in captured.err.splitlines() if ln.strip()] == [expected], argv
+        assert "Traceback" not in captured.out + captured.err, argv
+        assert "nests deeper than" not in captured.err, argv
 
-    # Nothing migrated: a refused read leaves the stored test set exactly as it was.
+    # Nothing migrated: a read leaves the stored test set exactly as it was.
     assert {p.name: (p / "tests.json").read_text()
             for p in home.iterdir() if p.is_dir()} == before
 
+    fn = Registry(home).get("rank")
+    assert fn is not None and len(fn.tests.examples) == 1
+    stored_example = fn.tests.examples[0]
+    assert nesting_depth(stored_example.output) == 600
 
-# --- the write path: a store must not hold what the loader refuses -------------------
-def test_the_store_refuses_an_example_it_would_not_read_back(tmp_path, sb, capsys):
-    """Security's follow-up: the cap guards loading but not storing, so `Registry.put`
-    could write an example that `_load` then refuses. The refusal is per function but
-    `list`/`get` walk every function, so one deep generated case takes the whole home
-    down — the store has to drop it before the write, without raising.
+    # The deep example is not special-cased away on read; it becomes a normal
+    # "uncomparable" when something compares it.
+    probe = Candidate(fn=fn,
+                      version=Version(name="probe", level=Level.VERIFIED,
+                                      code=FIXED_DEEP_IMPL),
+                      similarity=0.9)
+    assert reverify(probe, [stored_example], sb) is False
+    assert probe.why == "example 0 cannot be compared: " + UNCOMPARABLE
 
-    Red before the fix: `Registry(home).get("deepfn")` raises `ExampleTooDeep` here.
+
+# --- the write path: a store must not hold what it cannot compare -------------------
+def test_the_store_drops_an_example_it_could_not_compare(tmp_path, sb, capsys):
+    """The store-side gate. `Registry.put` is handed generated examples, and one whose
+    input or output nests past the cap can only ever make every future `verify` of that
+    function report UNCOMPARABLE — a permanent failing case the model was never able to
+    fix. So it is dropped **before** the write, silently, without raising; the function
+    itself is stored and stays readable by `get`/`list`.
+
+    The cap no longer belongs to the loader, so what this protects is the registry's
+    contents, not the read path: a stored set full of uncomparable cases would be a
+    lifetime REJECTED verdict.
     """
     from jitagent.llm import ScriptedClient
     from jitagent.registry import Registry
     from jitagent.synth import compile_function
-    from jitagent.types import MAX_VALUE_DEPTH, nesting_depth
+    from jitagent.types import nesting_depth
 
     home = tmp_path / "registry"
     reg = Registry(home)
@@ -420,7 +450,6 @@ def test_testset_add_drops_an_example_that_is_too_deep():
     cap can move in one place.
     """
     from jitagent.registry import TestSet
-    from jitagent.types import MAX_VALUE_DEPTH
 
     ts = TestSet()
     assert ts.add(Example({"x": nested(1, 200)}, {}, origin="generated")) is False
