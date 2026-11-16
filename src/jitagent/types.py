@@ -62,12 +62,10 @@ class Example:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any], index: int | None = None) -> "Example":
-        for field in ("input", "output"):
-            if nesting_depth(d[field]) > MAX_VALUE_DEPTH:
-                where = f"examples[{index}]" if index is not None else "example"
-                raise ExampleTooDeep(
-                    f"{where}.{field} nests deeper than {MAX_VALUE_DEPTH} levels — "
-                    "deeper than jitagent can compare")
+        # Any depth is accepted here: a case directory may legitimately hold a deep
+        # example, and `verify` reports it as uncomparable rather than refusing to load
+        # the case at all. The depth refusal belongs to the one caller that stores
+        # generated examples — see `check_example_depth`.
         return cls(input=d["input"], output=d["output"], note=d.get("note", ""),
                    boundary=d.get("boundary", False), origin=d.get("origin", "caller"),
                    assumes=d.get("assumes", ""))
@@ -167,6 +165,25 @@ def deep_equal(a: Any, b: Any, rel_tol: float = 1e-9, abs_tol: float = 1e-12) ->
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(deep_equal(x, y, rel_tol, abs_tol) for x, y in zip(a, b))
     return a == b
+
+
+def check_example_depth(d: dict[str, Any], index: int | None = None) -> None:
+    """Refuse an example whose input or output nests deeper than `MAX_VALUE_DEPTH`.
+
+    This is the store-path check, not the parse path: `Example.from_dict` accepts any
+    depth so that a case file can be verified (an uncomparable example is a failing
+    case, not a broken file), while `cmd_compile` must refuse before it spends a model
+    call and before it creates a registry directory — otherwise it would write an
+    example the loader refuses to read back.
+
+    Raises `ExampleTooDeep` with the message the depth contract has always used.
+    """
+    for field in ("input", "output"):
+        if nesting_depth(d[field]) > MAX_VALUE_DEPTH:
+            where = f"examples[{index}]" if index is not None else "example"
+            raise ExampleTooDeep(
+                f"{where}.{field} nests deeper than {MAX_VALUE_DEPTH} levels — "
+                "deeper than jitagent can compare")
 
 
 def nesting_depth(value: Any) -> int:
